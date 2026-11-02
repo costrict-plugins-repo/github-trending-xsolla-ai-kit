@@ -1,0 +1,29 @@
+{
+  "name": "xsolla-ai-kit",
+  "version": "1.4.0",
+  "description": "Xsolla agent skills toolkit — guided workflows from zero to a live game shop: a headless shop you host (payments, catalog, login, webhooks) or, in preview, an unpublished Shop Builder site assembled from a plain-language game description.",
+  "author": {
+    "name": "Xsolla"
+  },
+  "homepage": "https://github.com/xsolla/xsolla-ai-kit",
+  "repository": "https://github.com/xsolla/xsolla-ai-kit",
+  "license": "MIT",
+  "keywords": [
+    "xsolla",
+    "game-shop",
+    "payments",
+    "pay-station",
+    "catalog",
+    "webhooks",
+    "storefront",
+    "login",
+    "shop-builder",
+    "web-shop"
+  ],
+  "skills": "./skills/",
+  "mcpServers": {
+    "xsolla-docs": {
+      "url": "https://xsolla.mcp.kapa.ai"
+    }
+  }
+}

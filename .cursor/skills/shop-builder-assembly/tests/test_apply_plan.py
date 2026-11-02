@@ -1,0 +1,2423 @@
+from __future__ import annotations
+
+import contextlib
+import copy
+import hashlib
+import importlib.util
+import io
+import json
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+
+
+def load_apply_plan():
+    path = ROOT / "scripts" / "apply_plan.py"
+    spec = importlib.util.spec_from_file_location("apply_plan_for_tests", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+apply_plan = load_apply_plan()
+
+
+def load_verify_structure():
+    path = ROOT / "scripts" / "verify_structure.py"
+    spec = importlib.util.spec_from_file_location("verify_structure_for_tests", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+verify_structure = load_verify_structure()
+
+
+def load_preflight():
+    path = ROOT / "scripts" / "preflight.py"
+    spec = importlib.util.spec_from_file_location("preflight_for_tests", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+preflight = load_preflight()
+
+
+def load_render_plan():
+    path = ROOT / "scripts" / "render_plan.py"
+    spec = importlib.util.spec_from_file_location("render_plan_for_tests", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+render_plan = load_render_plan()
+
+APPROVED_CONTEXT = {"merchant_id": 100, "project_id": 200, "sandbox": False}
+
+
+def fresh_run_auth(logged_in: bool = False) -> dict:
+    return {"logged_in": logged_in, "context": dict(APPROVED_CONTEXT)}
+
+
+def config_result(**overrides: object) -> mock.Mock:
+    config = {"merchant_id": 100, "project_id": 200, **overrides}
+    return mock.Mock(
+        returncode=0, stderr="", stdout=json.dumps({"ok": True, "data": config})
+    )
+
+
+class ApplyPlanTests(unittest.TestCase):
+    def test_backup_structure_unwraps_cli_envelope(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            expected = {"_id": "landing", "pages": []}
+            (root / "structure.json").write_text(
+                json.dumps({"ok": True, "data": expected}), encoding="utf-8"
+            )
+            self.assertEqual(expected, apply_plan.backup_structure(root))
+
+    def test_structure_hash_ignores_volatile_component_ids(self) -> None:
+        first = {
+            "pages": [
+                {
+                    "_id": "page-id",
+                    "blocks": [
+                        {
+                            "_id": "block-id",
+                            "values": {
+                                "components": [
+                                    {"_id": "generated-one", "external_id": "group-1"}
+                                ]
+                            },
+                        }
+                    ],
+                }
+            ]
+        }
+        second = copy.deepcopy(first)
+        second["pages"][0]["blocks"][0]["values"]["components"][0]["_id"] = (
+            "generated-two"
+        )
+        self.assertEqual(
+            apply_plan.structure_hash(first), apply_plan.structure_hash(second)
+        )
+
+    def test_structure_hash_keeps_page_block_and_component_values(self) -> None:
+        original = {
+            "pages": [
+                {
+                    "_id": "page-id",
+                    "blocks": [
+                        {
+                            "_id": "block-id",
+                            "values": {
+                                "components": [
+                                    {"_id": "generated", "external_id": "group-1"}
+                                ]
+                            },
+                        }
+                    ],
+                }
+            ]
+        }
+        for path, replacement in (
+            (("pages", 0, "_id"), "other-page"),
+            (("pages", 0, "blocks", 0, "_id"), "other-block"),
+            (
+                (
+                    "pages",
+                    0,
+                    "blocks",
+                    0,
+                    "values",
+                    "components",
+                    0,
+                    "external_id",
+                ),
+                "group-2",
+            ),
+        ):
+            changed = copy.deepcopy(original)
+            target = changed
+            for segment in path[:-1]:
+                target = target[segment]
+            target[path[-1]] = replacement
+            self.assertNotEqual(
+                apply_plan.structure_hash(original), apply_plan.structure_hash(changed)
+            )
+
+    def test_website_exists_handles_wrapped_lists(self) -> None:
+        response = {
+            "ok": True,
+            "data": {"items": [{"domain": "one-shop"}, {"slug": "two-shop"}]},
+        }
+        self.assertTrue(apply_plan.website_exists(response, "two-shop"))
+        self.assertFalse(apply_plan.website_exists(response, "missing-shop"))
+
+    def test_page_for_path_finds_only_exact_path(self) -> None:
+        structure = {"pages": [{"path": "/", "_id": "home"}]}
+        self.assertEqual("home", apply_plan.page_for_path(structure, "/")["_id"])
+        self.assertIsNone(apply_plan.page_for_path(structure, "/store"))
+
+    def test_common_layout_is_created_only_after_missing_layout_check(self) -> None:
+        before = {"pages": [], "layouts": [], "blocks": []}
+        after = {
+            "pages": [],
+            "layouts": ["layout-id"],
+            "blocks": ["layout-id"],
+        }
+        with (
+            mock.patch.object(apply_plan, "structure", side_effect=[before, after]),
+            mock.patch.object(apply_plan, "cli_has_command", return_value=True),
+            mock.patch.object(
+                apply_plan,
+                "run_json",
+                return_value={"ok": True, "data": {"block": {"_id": "layout-id"}}},
+            ) as run_json,
+        ):
+            self.assertEqual("layout-id", apply_plan.ensure_common_layout("shop"))
+        run_json.assert_called_once_with(
+            "shopbuilder", "create-block", "--slug", "shop", "--block", "common-layout"
+        )
+
+    def test_common_layout_step_is_skipped_without_create_block(self) -> None:
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                apply_plan,
+                "structure",
+                return_value={"pages": [], "layouts": [], "blocks": []},
+            ),
+            mock.patch.object(apply_plan, "cli_has_command", return_value=False),
+            mock.patch.object(apply_plan, "run_json") as run_json,
+            contextlib.redirect_stderr(stderr),
+        ):
+            self.assertIsNone(apply_plan.ensure_common_layout("shop"))
+        run_json.assert_not_called()
+        self.assertIn(
+            "the common layout needs a newer Xsolla CLI; the site is built without it. A site "
+            "without the common layout won't open in the Editor, Publish or private preview",
+            stderr.getvalue(),
+        )
+
+    def test_common_layout_reuses_existing_layout(self) -> None:
+        current = {
+            "pages": [],
+            "layouts": ["layout-id"],
+            "blocks": ["layout-id"],
+        }
+        with (
+            mock.patch.object(apply_plan, "structure", return_value=current),
+            mock.patch.object(
+                apply_plan,
+                "run_json",
+                return_value={"ok": True, "data": {"module": "common-layout"}},
+            ) as run_json,
+        ):
+            self.assertEqual("layout-id", apply_plan.ensure_common_layout("shop"))
+        run_json.assert_called_once_with(
+            "shopbuilder", "get-block", "--slug", "shop", "--block-id", "layout-id"
+        )
+
+    def test_common_layout_is_found_after_a_side_by_side_layout(self) -> None:
+        current = {
+            "pages": [],
+            "layouts": ["side-id", "common-id"],
+            "blocks": ["side-id", "common-id", "page-block"],
+        }
+        modules = {"side-id": "side-by-side-layout", "common-id": "common-layout"}
+
+        def cli(*args: str) -> dict:
+            if args[1] != "get-block":
+                raise AssertionError(f"unexpected CLI call: {args}")
+            return {"ok": True, "data": {"module": modules[args[-1]]}}
+
+        with (
+            mock.patch.object(apply_plan, "structure", return_value=current),
+            mock.patch.object(apply_plan, "run_json", side_effect=cli),
+        ):
+            self.assertEqual("common-id", apply_plan.ensure_common_layout("shop"))
+
+    def test_side_by_side_layout_alone_gets_a_common_layout(self) -> None:
+        before = {"pages": [], "layouts": ["side-id"], "blocks": ["side-id"]}
+        after = {
+            "pages": [],
+            "layouts": ["side-id", "common-id"],
+            "blocks": ["side-id", "common-id"],
+        }
+        calls = []
+
+        def cli(*args: str) -> dict:
+            calls.append(args[1])
+            if args[1] == "get-block":
+                return {"ok": True, "data": {"module": "side-by-side-layout"}}
+            return {"ok": True, "data": {"block": {"_id": "common-id"}}}
+
+        with (
+            mock.patch.object(apply_plan, "structure", side_effect=[before, after]),
+            mock.patch.object(apply_plan, "cli_has_command", return_value=True),
+            mock.patch.object(apply_plan, "run_json", side_effect=cli),
+        ):
+            self.assertEqual("common-id", apply_plan.ensure_common_layout("shop"))
+        self.assertEqual(["get-block", "create-block"], calls)
+
+    def test_common_layout_rejects_unpersisted_layout(self) -> None:
+        with (
+            mock.patch.object(
+                apply_plan,
+                "structure",
+                side_effect=[
+                    {"pages": [], "layouts": [], "blocks": []},
+                    {"pages": [], "layouts": [], "blocks": []},
+                ],
+            ),
+            mock.patch.object(apply_plan, "cli_has_command", return_value=True),
+            mock.patch.object(
+                apply_plan, "run_json", return_value={"block": {"_id": "missing"}}
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "missing from the saved"):
+                apply_plan.ensure_common_layout("shop")
+
+    def test_verified_backup_requires_identity_and_matching_checksums(self) -> None:
+        expected = {
+            "merchant_id": 100,
+            "project_id": 200,
+            "environment": "test",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in apply_plan.BACKUP_FILE_NAMES:
+                (root / name).write_bytes(b"{}\n")
+            structure = root / "structure.json"
+            manifest = {
+                "slug": "test-shop",
+                **expected,
+                "read_only": True,
+                "files": sorted(apply_plan.BACKUP_FILE_NAMES),
+                "sha256": {
+                    name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+                    for name in apply_plan.BACKUP_FILE_NAMES
+                },
+            }
+            (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            self.assertTrue(apply_plan.verified_backup(root, expected, "test-shop"))
+            structure.write_bytes(b"changed\n")
+            self.assertFalse(apply_plan.verified_backup(root, expected, "test-shop"))
+
+    def test_verified_backup_rejects_partial_digest_manifest(self) -> None:
+        expected = {"merchant_id": 100, "project_id": 200, "environment": "test"}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("structure.json", "landing.json"):
+                (root / name).write_bytes(b"{}\n")
+            manifest = {
+                "slug": "test-shop",
+                **expected,
+                "read_only": True,
+                "files": sorted(apply_plan.BACKUP_FILE_NAMES),
+                "sha256": {
+                    "structure.json": hashlib.sha256(
+                        (root / "structure.json").read_bytes()
+                    ).hexdigest()
+                },
+            }
+            (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            self.assertFalse(apply_plan.verified_backup(root, expected, "test-shop"))
+
+    def test_real_cli_shape_keeps_full_blocks_on_pages(self) -> None:
+        structure = {
+            "_id": "landing",
+            "blocks": ["site-block-id"],
+            "pages": [
+                {
+                    "_id": "home",
+                    "path": "/",
+                    "blocks": [{"_id": "block-1", "module": "header"}],
+                }
+            ],
+        }
+        page = apply_plan.page_for_path(structure, "/")
+        self.assertEqual("header", page["blocks"][0]["module"])
+
+    def test_reconciliation_refuses_unconfirmed_removal_before_write(self) -> None:
+        current = {
+            "_id": "landing",
+            "pages": [
+                {
+                    "_id": "home",
+                    "path": "/",
+                    "blocks": [
+                        {"_id": "header-id", "module": "header"},
+                        {"_id": "custom-id", "module": "gallery"},
+                    ],
+                }
+            ],
+        }
+        plan = {
+            "name": "Home",
+            "path": "/",
+            "blocks": ["header"],
+            "removals": [],
+        }
+        with (
+            mock.patch.object(apply_plan, "structure", return_value=current),
+            mock.patch.object(apply_plan, "run_json") as run_json,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "unconfirmed block removals"):
+                apply_plan.reconcile_page("shop", "landing", plan)
+            run_json.assert_not_called()
+
+    def test_reconciliation_returns_immediately_for_exact_page(self) -> None:
+        current = {
+            "pages": [
+                {
+                    "_id": "home",
+                    "path": "/",
+                    "blocks": [
+                        {"_id": "header", "module": "header"},
+                        {"_id": "footer", "module": "footer"},
+                    ],
+                }
+            ]
+        }
+        plan = {
+            "name": "Home",
+            "path": "/",
+            "blocks": ["header", "footer"],
+            "removals": [],
+        }
+        with (
+            mock.patch.object(apply_plan, "structure", return_value=current) as structure,
+            mock.patch.object(apply_plan, "run_json") as run_json,
+        ):
+            result = apply_plan.reconcile_page("shop", "landing", plan)
+        structure.assert_called_once_with("shop")
+        run_json.assert_not_called()
+        self.assertEqual(["header", "footer"], result["blocks"])
+        self.assertEqual([], result["hidden_custom_code"])
+
+    def test_reconciliation_batches_confirmed_removals_in_descending_order(self) -> None:
+        current = {
+            "_id": "landing",
+            "pages": [
+                {
+                    "_id": "home",
+                    "path": "/",
+                    "blocks": [
+                        {"_id": "header", "module": "header"},
+                        {"_id": "remove-one", "module": "packs"},
+                        {"_id": "remove-two", "module": "gallery"},
+                        {"_id": "footer", "module": "footer"},
+                    ],
+                }
+            ],
+        }
+        final = {
+            "_id": "landing",
+            "pages": [
+                {
+                    "_id": "home",
+                    "path": "/",
+                    "blocks": [
+                        {"_id": "header", "module": "header"},
+                        {"_id": "footer", "module": "footer"},
+                    ],
+                }
+            ],
+        }
+        plan = {
+            "name": "Home",
+            "path": "/",
+            "blocks": ["header", "footer"],
+            "removals": [
+                {"block_id": "remove-one", "module": "packs"},
+                {"block_id": "remove-two", "module": "gallery"},
+            ],
+        }
+        with (
+            mock.patch.object(
+                apply_plan,
+                "structure",
+                side_effect=[current, final, final, final, final],
+            ),
+            mock.patch.object(apply_plan, "run_json") as run_json,
+        ):
+            result = apply_plan.reconcile_page("shop", "landing", plan)
+        run_json.assert_called_once()
+        args = run_json.call_args.args
+        self.assertEqual("update-block", args[1])
+        payload = json.loads(args[-1])
+        self.assertEqual(
+            [
+                {"op": "remove", "path": ["blocks", 2]},
+                {"op": "remove", "path": ["blocks", 1]},
+            ],
+            payload["removeBlocks"]["patches"],
+        )
+        self.assertEqual(2, result["removed_blocks"])
+
+    def test_reconciliation_preserves_federated_effective_module(self) -> None:
+        current = {
+            "_id": "landing",
+            "pages": [
+                {
+                    "_id": "home",
+                    "path": "/",
+                    "blocks": [
+                        {
+                            "_id": "offer-chain",
+                            "module": "federated",
+                            "values": {"blockId": "sb-offer-chain"},
+                        }
+                    ],
+                }
+            ],
+        }
+        plan = {
+            "name": "Home",
+            "path": "/",
+            "blocks": ["sb-offer-chain"],
+            "removals": [],
+        }
+        with (
+            mock.patch.object(apply_plan, "structure", return_value=current),
+            mock.patch.object(apply_plan, "run_json") as run_json,
+        ):
+            result = apply_plan.reconcile_page("shop", "landing", plan)
+        run_json.assert_not_called()
+        self.assertEqual(["sb-offer-chain"], result["blocks"])
+
+    def test_run_preflight_propagates_failure(self) -> None:
+        failed = mock.Mock(
+            returncode=1, stderr="Preflight failed: wrong project", stdout=""
+        )
+        with mock.patch.object(apply_plan.subprocess, "run", return_value=failed):
+            with self.assertRaisesRegex(RuntimeError, "wrong project"):
+                apply_plan.run_preflight(Path("brief.json"), None)
+
+    def test_run_json_refuses_force_before_login_or_write(self) -> None:
+        with mock.patch.object(apply_plan.subprocess, "run") as run:
+            with self.assertRaisesRegex(RuntimeError, "--force is prohibited"):
+                apply_plan.run_json("shopbuilder", "delete-block", "--force")
+            run.assert_not_called()
+
+    def test_run_json_retries_pre_request_session_bootstrap_rate_limit(self) -> None:
+        limited = mock.Mock(
+            returncode=1,
+            stderr="publisher session bootstrap failed (HTTP 429)",
+            stdout="",
+        )
+        succeeded = mock.Mock(returncode=0, stderr="", stdout='{"ok":true}')
+        with (
+            mock.patch.object(
+                apply_plan.subprocess, "run", side_effect=[limited, limited, succeeded]
+            ) as run,
+            mock.patch.object(apply_plan.time, "sleep") as sleep,
+        ):
+            self.assertEqual({"ok": True}, apply_plan.run_json("config", "list"))
+        self.assertEqual(3, run.call_count)
+        self.assertEqual([mock.call(5), mock.call(10)], sleep.call_args_list)
+
+    def test_run_json_does_not_retry_ambiguous_operation_failure(self) -> None:
+        failed = mock.Mock(returncode=1, stderr="request failed (HTTP 429)", stdout="")
+        with (
+            mock.patch.dict(apply_plan.RUN_AUTH, fresh_run_auth()),
+            mock.patch.object(apply_plan.subprocess, "run", side_effect=[failed]) as run,
+            mock.patch.object(apply_plan.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "HTTP 429"):
+                apply_plan.run_json("shopbuilder", "update-block")
+        run.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_run_json_does_not_log_in_when_commands_succeed(self) -> None:
+        succeeded = mock.Mock(returncode=0, stderr="", stdout='{"ok":true}')
+        with (
+            mock.patch.dict(apply_plan.RUN_AUTH, fresh_run_auth()),
+            mock.patch.object(
+                apply_plan.subprocess, "run", side_effect=[succeeded, succeeded]
+            ) as run,
+            mock.patch.object(apply_plan.time, "sleep") as sleep,
+        ):
+            apply_plan.run_json("shopbuilder", "list-websites")
+            apply_plan.run_json("shopbuilder", "get-structure", "--slug", "shop")
+            self.assertFalse(apply_plan.RUN_AUTH["logged_in"])
+        self.assertEqual(
+            [
+                ["xsolla", "shopbuilder", "list-websites", "--json"],
+                ["xsolla", "shopbuilder", "get-structure", "--slug", "shop", "--json"],
+            ],
+            [call.args[0] for call in run.call_args_list],
+        )
+        sleep.assert_not_called()
+
+    def test_run_json_logs_in_once_and_retries_after_auth_failure(self) -> None:
+        failures = {
+            "missing bootstrap cookie": (
+                1,
+                "auto-bootstrapping publisher session from stored token: publisher "
+                "session bootstrap did not yield a pa-v4-token or ps2[user_session] cookie",
+            ),
+            "no usable token": (1, "authentication required for this command."),
+            "API 401": (10, '{"ok": false, "error": {"code": "http_401"}}'),
+        }
+        login_succeeded = mock.Mock(returncode=0, stderr="", stdout="Login successful")
+        succeeded = mock.Mock(returncode=0, stderr="", stdout='{"ok":true}')
+        for name, (returncode, stderr) in failures.items():
+            failed = mock.Mock(returncode=returncode, stderr=stderr, stdout="")
+            with self.subTest(name):
+                with (
+                    mock.patch.dict(apply_plan.RUN_AUTH, fresh_run_auth()),
+                    mock.patch.object(
+                        apply_plan.subprocess,
+                        "run",
+                        side_effect=[failed, login_succeeded, config_result(), succeeded],
+                    ) as run,
+                    mock.patch.object(apply_plan.time, "sleep") as sleep,
+                ):
+                    self.assertEqual(
+                        {"ok": True}, apply_plan.run_json("shopbuilder", "get-structure")
+                    )
+                    self.assertTrue(apply_plan.RUN_AUTH["logged_in"])
+                self.assertEqual(
+                    [
+                        ["xsolla", "shopbuilder", "get-structure", "--json"],
+                        ["xsolla", "auth", "login"],
+                        ["xsolla", "config", "list", "--json"],
+                        ["xsolla", "shopbuilder", "get-structure", "--json"],
+                    ],
+                    [call.args[0] for call in run.call_args_list],
+                )
+                sleep.assert_called_once_with(apply_plan.LOGIN_SETTLE_SECONDS)
+
+    def test_run_json_never_logs_in_twice_in_one_run(self) -> None:
+        missing_cookie = mock.Mock(
+            returncode=1,
+            stderr="publisher session bootstrap did not yield a pa-v4-token cookie",
+            stdout="",
+        )
+        login_succeeded = mock.Mock(returncode=0, stderr="", stdout="Login successful")
+        with (
+            mock.patch.dict(apply_plan.RUN_AUTH, fresh_run_auth()),
+            mock.patch.object(
+                apply_plan.subprocess,
+                "run",
+                side_effect=[missing_cookie, login_succeeded, config_result(), missing_cookie],
+            ) as run,
+            mock.patch.object(apply_plan.time, "sleep"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "still fails after this run's one `xsolla auth login`"
+            ):
+                apply_plan.run_json("shopbuilder", "get-structure")
+        self.assertEqual(
+            1,
+            [call.args[0] for call in run.call_args_list].count(["xsolla", "auth", "login"]),
+        )
+
+        with (
+            mock.patch.dict(apply_plan.RUN_AUTH, fresh_run_auth(logged_in=True)),
+            mock.patch.object(
+                apply_plan.subprocess, "run", side_effect=[missing_cookie]
+            ) as run,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "still fails"):
+                apply_plan.run_json("shopbuilder", "list-websites")
+        run.assert_called_once()
+
+    def test_run_json_aborts_when_login_changes_cli_context(self) -> None:
+        missing_cookie = mock.Mock(
+            returncode=1,
+            stderr="publisher session bootstrap did not yield a pa-v4-token cookie",
+            stdout="",
+        )
+        login_succeeded = mock.Mock(returncode=0, stderr="", stdout="Login successful")
+        for drift, message in (
+            ({"project_id": 300}, r"\(project_id 200 -> 300\)"),
+            ({"merchant_id": 101}, r"\(merchant_id 100 -> 101\)"),
+            ({"sandbox": True}, r"\(sandbox False -> True\)"),
+        ):
+            with self.subTest(drift=drift):
+                with (
+                    mock.patch.dict(apply_plan.RUN_AUTH, fresh_run_auth()),
+                    mock.patch.object(
+                        apply_plan.subprocess,
+                        "run",
+                        side_effect=[missing_cookie, login_succeeded, config_result(**drift)],
+                    ) as run,
+                    mock.patch.object(apply_plan.time, "sleep"),
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "CLI context changed after `xsolla auth login` " + message
+                    ):
+                        apply_plan.run_json("shopbuilder", "update-block")
+                self.assertEqual(3, run.call_count)
+
+    def test_run_json_says_a_rerun_is_safe_when_a_run_ends_after_its_login(self) -> None:
+        missing_cookie = mock.Mock(
+            returncode=1,
+            stderr="publisher session bootstrap did not yield a pa-v4-token cookie",
+            stdout="",
+        )
+        login_succeeded = mock.Mock(returncode=0, stderr="", stdout="")
+        endings = {
+            "second auth failure": [
+                missing_cookie,
+                login_succeeded,
+                config_result(),
+                missing_cookie,
+            ],
+            "context drift": [missing_cookie, login_succeeded, config_result(project_id=300)],
+        }
+        for ending, results in endings.items():
+            with self.subTest(ending):
+                with (
+                    mock.patch.dict(apply_plan.RUN_AUTH, fresh_run_auth()),
+                    mock.patch.object(apply_plan.subprocess, "run", side_effect=results),
+                    mock.patch.object(apply_plan.time, "sleep"),
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "made no change, so it is safe to rerun"
+                    ):
+                        apply_plan.run_json("shopbuilder", "update-block")
+
+    def test_run_json_does_not_log_in_for_exhausted_bootstrap_rate_limit(self) -> None:
+        limited = mock.Mock(
+            returncode=1,
+            stderr="auto-bootstrapping publisher session from stored token: "
+            "publisher session bootstrap failed (HTTP 429)",
+            stdout="",
+        )
+        with (
+            mock.patch.dict(apply_plan.RUN_AUTH, fresh_run_auth()),
+            mock.patch.object(
+                apply_plan.subprocess, "run", side_effect=[limited] * 4
+            ) as run,
+            mock.patch.object(apply_plan.time, "sleep"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "HTTP 429"):
+                apply_plan.run_json("shopbuilder", "list-websites")
+        self.assertEqual(4, run.call_count)
+        self.assertNotIn(
+            ["xsolla", "auth", "login"], [call.args[0] for call in run.call_args_list]
+        )
+
+    def test_supported_login_times_out_after_one_retry(self) -> None:
+        timeout = subprocess.TimeoutExpired(["xsolla", "auth", "login"], 45)
+        with (
+            mock.patch.object(
+                apply_plan.subprocess, "run", side_effect=[timeout, timeout]
+            ) as run,
+            mock.patch.object(apply_plan.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "timed out"):
+                apply_plan.refresh_supported_login()
+        self.assertEqual(2, run.call_count)
+        sleep.assert_called_once_with(apply_plan.LOGIN_RETRY_DELAY_SECONDS)
+
+    def test_ensure_locales_adds_only_missing_languages(self) -> None:
+        before = {"languages": ["en-US"]}
+        after = {"languages": ["en-US", "de-DE"]}
+        with (
+            mock.patch.object(apply_plan, "structure", side_effect=[before, after]),
+            mock.patch.object(apply_plan, "run_json") as run_json,
+        ):
+            result = apply_plan.ensure_locales("shop", ["en-US", "de-DE"])
+        run_json.assert_called_once_with(
+            "shopbuilder", "add-language", "--slug", "shop", "--language", "de-DE"
+        )
+        self.assertEqual(["de-DE"], result["added"])
+
+    def test_ensure_locales_is_idempotent_when_languages_exist(self) -> None:
+        structure = {"languages": ["en-US", "de-DE"]}
+        with (
+            mock.patch.object(
+                apply_plan, "structure", side_effect=[structure, structure]
+            ),
+            mock.patch.object(apply_plan, "run_json") as run_json,
+        ):
+            result = apply_plan.ensure_locales("shop", ["en-US", "de-DE"])
+        run_json.assert_not_called()
+        self.assertEqual([], result["added"])
+
+    def test_ensure_locales_rejects_malformed_refreshed_languages(self) -> None:
+        with (
+            mock.patch.object(
+                apply_plan,
+                "structure",
+                side_effect=[{"languages": ["en-US"]}, {"languages": ["en-US", {}]}],
+            ),
+            mock.patch.object(apply_plan, "run_json"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "locale reconciliation"):
+                apply_plan.ensure_locales("shop", ["en-US", "de-DE"])
+
+    def test_header_navigation_reuses_buttons_and_targets_pages(self) -> None:
+        header = {
+            "values": {
+                "components": {
+                    "button-a": {
+                        "id": "button-a",
+                        "type": "button",
+                        "button": {
+                            "action": {
+                                "action": "scroll",
+                                "targetId": "old",
+                                "text": {"enable": True, "id": "L:existing"},
+                            },
+                            "variant": {"type": "extra", "value": "header-button"},
+                        },
+                    },
+                    "locale": {"id": "locale", "type": "locale-select"},
+                },
+                "fixedComponents": [],
+                "leftComponents": ["button-a"],
+                "rightComponents": ["locale"],
+            }
+        }
+        patches, labels = apply_plan.header_navigation_patches(
+            header,
+            "landing",
+            "home",
+            [
+                {"name": "Home", "path": "/", "page_id": "home"},
+                {"name": "Store", "path": "/store", "page_id": "store"},
+            ],
+        )
+        action_patch = next(
+            patch
+            for patch in patches
+            if patch["path"]
+            == ["values", "components", "button-a", "button", "action"]
+        )
+        self.assertEqual("page", action_patch["value"]["action"])
+        self.assertEqual("home", action_patch["value"]["pageId"])
+        self.assertEqual("Home", labels["L:existing"])
+        addition = next(
+            patch
+            for patch in patches
+            if patch["op"] == "add" and patch["path"][:2] == ["values", "components"]
+        )
+        self.assertEqual("store", addition["value"]["button"]["action"]["pageId"])
+        right_patch = next(
+            patch for patch in patches if patch["path"] == ["values", "rightComponents"]
+        )
+        self.assertEqual("locale", right_patch["value"][0])
+        self.assertEqual(3, len(right_patch["value"]))
+
+    def test_navigation_component_ids_are_stable(self) -> None:
+        first = apply_plan.stable_component_id("landing", "home", "/store")
+        second = apply_plan.stable_component_id("landing", "home", "/store")
+        self.assertEqual(first, second)
+
+    def test_catalog_patches_are_targeted_and_remove_stale_sections(self) -> None:
+        components = [
+            {
+                "_id": "first",
+                "enable": True,
+                "section": {
+                    "item": {"autoSelected": True, "group": "old", "type": "bundle"},
+                    "title": {"enable": True, "id": "L:old"},
+                },
+                "card": {"selectedLayoutType": "featured"},
+            },
+            {
+                "_id": "stale",
+                "enable": True,
+                "section": {
+                    "item": {"autoSelected": False, "group": "stale", "type": "bundle"},
+                    "title": {"enable": True, "id": "L:stale"},
+                },
+                "card": {"selectedLayoutType": "featured"},
+            },
+        ]
+        patches = apply_plan.catalog_patches(
+            components,
+            [
+                {
+                    "external_id": "__all__",
+                    "type": "virtual_currency",
+                    "layout": "vertical",
+                    "title_enabled": False,
+                }
+            ],
+        )
+        self.assertFalse(any(patch["path"] == ["components"] for patch in patches))
+        self.assertIn(
+            {"op": "remove", "path": ["components", 1]},
+            patches,
+        )
+        self.assertIn(
+            {
+                "op": "replace",
+                "path": ["components", 0, "section", "item", "group"],
+                "value": "__all__",
+            },
+            patches,
+        )
+
+    def test_catalog_patches_add_from_sanitized_template(self) -> None:
+        components = [
+            {
+                "_id": "template-id",
+                "enable": True,
+                "section": {
+                    "item": {"autoSelected": True, "group": "old", "type": "bundle"},
+                    "title": {"enable": True, "id": "L:old"},
+                },
+                "card": {"selectedLayoutType": "featured"},
+            }
+        ]
+        sections = [
+            {"external_id": "one", "type": "bundle", "layout": "featured", "title_enabled": False},
+            {"external_id": "two", "type": "virtual_good", "layout": "vertical", "title_enabled": False},
+        ]
+        patches = apply_plan.catalog_patches(components, sections)
+        addition = next(patch for patch in patches if patch["op"] == "add")
+        self.assertNotIn("_id", addition["value"])
+        self.assertEqual("two", addition["value"]["section"]["item"]["group"])
+
+    def test_wire_catalog_sections_verifies_result(self) -> None:
+        before = {
+            "pages": [
+                {
+                    "path": "/",
+                    "blocks": [
+                        {
+                            "_id": "store",
+                            "module": "newStore",
+                            "components": [
+                                {
+                                    "enable": True,
+                                    "section": {
+                                        "item": {"autoSelected": True, "group": "old", "type": "bundle"},
+                                        "title": {"enable": True},
+                                    },
+                                    "card": {"selectedLayoutType": "featured"},
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+        after = copy.deepcopy(before)
+        component = after["pages"][0]["blocks"][0]["components"][0]
+        component["section"]["item"] = {
+            "autoSelected": False,
+            "group": "__all__",
+            "type": "virtual_currency",
+        }
+        component["section"]["title"]["enable"] = False
+        component["card"]["selectedLayoutType"] = "vertical"
+        plan = {
+            "pages": [{"path": "/"}],
+            "catalog_sections": [
+                {
+                    "external_id": "__all__",
+                    "type": "virtual_currency",
+                    "layout": "vertical",
+                    "title_enabled": False,
+                }
+            ],
+        }
+        with (
+            mock.patch.object(apply_plan, "structure", side_effect=[before, after]),
+            mock.patch.object(apply_plan, "run_json") as run_json,
+        ):
+            result = apply_plan.wire_catalog_sections("shop", "landing", plan)
+        run_json.assert_called_once()
+        self.assertEqual("store", result[0]["block_id"])
+
+    def test_empty_catalog_preserves_existing_store_configuration(self) -> None:
+        with (
+            mock.patch.object(apply_plan, "structure") as structure,
+            mock.patch.object(apply_plan, "run_json") as run_json,
+        ):
+            result = apply_plan.wire_catalog_sections(
+                "shop", "landing", {"catalog_sections": [], "pages": []}
+            )
+        self.assertEqual([], result)
+        structure.assert_not_called()
+        run_json.assert_not_called()
+
+    def test_structure_verifier_accepts_matching_unpublished_site(self) -> None:
+        plan = {
+            "confirmation_id": "sha256:test",
+            "target": {"merchant_id": 100, "project_id": 200, "slug": "shop"},
+            "locales": ["en-US"],
+            "catalog_sections": [],
+            "pages": [
+                {
+                    "path": "/",
+                    "blocks": ["header", "footer"],
+                    "preserved_blocks": [],
+                    "removals": [],
+                }
+            ],
+        }
+        structure = {
+            "ok": True,
+            "data": {
+                "merchantId": "100",
+                "projectId": "200",
+                "domain": "shop",
+                "type": "store",
+                "published": None,
+                "languages": ["en-US"],
+                "pages": [
+                    {
+                        "path": "/",
+                        "blocks": [
+                            {"_id": "header", "module": "header"},
+                            {"_id": "footer", "module": "footer"},
+                        ],
+                    }
+                ],
+            },
+        }
+        result = verify_structure.verify(plan, structure)
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["published"])
+
+    def test_structure_verifier_checks_catalog_sections(self) -> None:
+        plan = {
+            "target": {"merchant_id": 100, "project_id": 200, "slug": "shop"},
+            "locales": ["en-US"],
+            "catalog_sections": [
+                {
+                    "external_id": "__all__",
+                    "type": "virtual_currency",
+                    "layout": "vertical",
+                }
+            ],
+            "pages": [{"path": "/", "blocks": ["newStore"]}],
+        }
+        structure = {
+            "merchantId": 100,
+            "projectId": 200,
+            "domain": "shop",
+            "type": "store",
+            "published": None,
+            "languages": ["en-US"],
+            "pages": [
+                {
+                    "path": "/",
+                    "blocks": [
+                        {
+                            "_id": "store",
+                            "module": "newStore",
+                            "components": [
+                                {
+                                    "enable": True,
+                                    "section": {"item": {"group": "wrong", "type": "bundle"}},
+                                    "card": {"selectedLayoutType": "featured"},
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+        result = verify_structure.verify(plan, structure)
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("catalog sections differ" in error for error in result["errors"]))
+
+    def test_structure_verifier_checks_internal_navigation(self) -> None:
+        plan = {
+            "target": {"merchant_id": 100, "project_id": 200, "slug": "shop"},
+            "locales": ["en-US"],
+            "catalog_sections": [],
+            "navigation": [{"name": "Home", "path": "/", "page_id": "home"}],
+            "pages": [{"path": "/", "blocks": ["header"]}],
+        }
+        structure = {
+            "merchantId": 100,
+            "projectId": 200,
+            "domain": "shop",
+            "type": "store",
+            "published": None,
+            "languages": ["en-US"],
+            "pages": [
+                {
+                    "_id": "home",
+                    "path": "/",
+                    "blocks": [
+                        {
+                            "_id": "header",
+                            "module": "header",
+                            "values": {
+                                "rightComponents": ["home-link"],
+                                "components": {
+                                    "home-link": {
+                                        "type": "button",
+                                        "button": {
+                                            "action": {"action": "page", "pageId": "wrong"}
+                                        },
+                                    }
+                                },
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+        result = verify_structure.verify(plan, structure)
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("navigation differs" in error for error in result["errors"]))
+
+    def test_structure_verifier_reports_order_and_publication(self) -> None:
+        plan = {
+            "target": {"merchant_id": 100, "project_id": 200, "slug": "shop"},
+            "locales": ["en-US"],
+            "pages": [{"path": "/", "blocks": ["header", "footer"]}],
+        }
+        structure = {
+            "merchantId": 100,
+            "projectId": 200,
+            "domain": "shop",
+            "type": "store",
+            "published": 1,
+            "languages": ["en-US"],
+            "pages": [
+                {
+                    "path": "/",
+                    "blocks": [
+                        {"_id": "footer", "module": "footer"},
+                        {"_id": "header", "module": "header"},
+                    ],
+                }
+            ],
+        }
+        result = verify_structure.verify(plan, structure)
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["published"])
+        self.assertTrue(
+            any("block order differs" in error for error in result["errors"])
+        )
+
+    def test_structure_verifier_resolves_federated_effective_module(self) -> None:
+        plan = {
+            "target": {"merchant_id": 100, "project_id": 200, "slug": "shop"},
+            "locales": ["en-US"],
+            "pages": [{"path": "/", "blocks": ["sb-offer-chain"]}],
+        }
+        structure = {
+            "merchantId": 100,
+            "projectId": 200,
+            "domain": "shop",
+            "type": "store",
+            "published": None,
+            "languages": ["en-US"],
+            "pages": [
+                {
+                    "path": "/",
+                    "blocks": [
+                        {
+                            "_id": "offer-chain",
+                            "module": "federated",
+                            "values": {"blockId": "sb-offer-chain"},
+                        }
+                    ],
+                }
+            ],
+        }
+        result = verify_structure.verify(plan, structure)
+        self.assertTrue(result["ok"])
+        self.assertEqual(["sb-offer-chain"], result["pages"][0]["blocks"])
+
+    def test_structure_verifier_requires_planned_common_layout(self) -> None:
+        plan = {
+            "target": {"merchant_id": 100, "project_id": 200, "slug": "shop"},
+            "site_layout": {"module": "common-layout"},
+            "locales": ["en-US"],
+            "pages": [],
+        }
+        structure = {
+            "merchantId": 100,
+            "projectId": 200,
+            "domain": "shop",
+            "type": "store",
+            "published": None,
+            "languages": ["en-US"],
+            "pages": [],
+            "layouts": [],
+            "blocks": [],
+        }
+        modules = {"side-id": "side-by-side-layout", "layout-id": "common-layout"}
+        self.assertFalse(verify_structure.verify(plan, structure, modules.get)["ok"])
+        skipped = verify_structure.verify(
+            plan, structure, modules.get, layout_required=False
+        )
+        self.assertTrue(skipped["ok"], skipped["errors"])
+        self.assertEqual(
+            [
+                "the common layout needs a newer Xsolla CLI; the site is built without it. A site "
+                "without the common layout won't open in the Editor, Publish or private preview"
+            ],
+            skipped["warnings"],
+        )
+        structure["layouts"] = ["side-id"]
+        structure["blocks"] = ["side-id"]
+        self.assertEqual(
+            ["site-level common layout is missing"],
+            verify_structure.verify(plan, structure, modules.get)["errors"],
+        )
+        structure["layouts"] = ["side-id", "layout-id"]
+        structure["blocks"] = ["side-id", "layout-id"]
+        result = verify_structure.verify(plan, structure, modules.get)
+        self.assertTrue(result["ok"], result["errors"])
+        structure["blocks"] = ["side-id"]
+        self.assertIn(
+            "site-level common layout is inconsistent: existing common layout is "
+            "missing from site blocks",
+            verify_structure.verify(plan, structure, modules.get)["errors"],
+        )
+
+
+EXAMPLE_BRIEF = ROOT / "examples" / "mobile-single-page.json"
+
+
+def approved_plan_file(directory: str | Path, plan: dict) -> str:
+    """Save ``plan`` as the plan the developer approved; apply_plan.py requires one."""
+    path = Path(directory) / "approved-plan.json"
+    path.write_text(json.dumps(plan), encoding="utf-8")
+    return str(path)
+
+
+def object_path(path: str) -> dict:
+    return {"pathSegment": path, "type": "static"}
+
+
+class FakeShopBuilderCli:
+    """In-memory `xsolla` stand-in whose get-structure returns object page paths.
+
+    Like the real API, get-structure lists site-level blocks and layouts by ID only;
+    get-block returns a site block's module.
+    """
+
+    def __init__(self, brief: dict) -> None:
+        self.project = brief["project"]
+        self.landing: dict | None = None
+        self.site_modules: dict[str, str] = {}
+        self.calls: list[tuple[str, ...]] = []
+
+    def module_of(self, block_id: str) -> str | None:
+        return self.site_modules.get(block_id)
+
+    def __call__(self, *args: str) -> object:
+        self.calls.append(args)
+        if args == ("config", "list"):
+            return {
+                "ok": True,
+                "data": {
+                    "merchant_id": self.project["merchant_id"],
+                    "project_id": self.project["project_id"],
+                    "sandbox": self.project["environment"] == "sandbox",
+                },
+            }
+        command = args[1]
+        options = dict(zip(args[2::2], args[3::2]))
+        if command == "list-websites":
+            return {"ok": True, "data": [self.landing] if self.landing else []}
+        if command == "create-website":
+            self.landing = {
+                "_id": "landing-1",
+                "domain": options["--slug"],
+                "merchantId": self.project["merchant_id"],
+                "projectId": self.project["project_id"],
+                "type": None,
+                "published": None,
+                "languages": ["en-US"],
+                "pages": [],
+                "layouts": [],
+                "blocks": [],
+            }
+            return {"ok": True, "data": copy.deepcopy(self.landing)}
+        if command == "get-structure":
+            return {"ok": True, "data": copy.deepcopy(self.landing)}
+        if command == "create-block":
+            block_id = f"site-block-{len(self.landing['blocks']) + 1}"
+            self.site_modules[block_id] = options["--block"]
+            self.landing["blocks"].append(block_id)
+            self.landing["layouts"].append(block_id)
+            return {"ok": True, "data": {"block": {"_id": block_id}}}
+        if command == "get-block":
+            return {"ok": True, "data": {"module": self.module_of(options["--block-id"])}}
+        if command == "set-landing-type":
+            self.landing["type"] = options["--type"]
+            return {"ok": True}
+        if command == "add-page":
+            if not isinstance(options["--path"], str):
+                raise AssertionError("add-page must receive a string path")
+            self.landing["pages"].append(
+                {
+                    "_id": f"page-{len(self.landing['pages']) + 1}",
+                    "name": options["--name"],
+                    "path": object_path(options["--path"]),
+                    "blocks": [
+                        {"_id": "scaffold-header", "module": "header"},
+                        {"_id": "scaffold-footer", "module": "footer"},
+                    ],
+                }
+            )
+            return {"ok": True}
+        if command == "add-language":
+            self.landing["languages"].append(options["--language"])
+            return {"ok": True}
+        raise AssertionError(f"unexpected CLI call: {args}")
+
+
+def reconciled_landing(landing: dict, plan: dict) -> dict:
+    """Return the landing as block reconciliation leaves it, keeping object paths."""
+    final = copy.deepcopy(landing)
+    page_ids = [target["page_id"] for target in plan["navigation"]]
+    for page_plan in plan["pages"]:
+        page = apply_plan.page_for_path(final, page_plan["path"])
+        blocks = []
+        for module in page_plan["blocks"]:
+            block = {"_id": f"{page['_id']}-{module}", "module": module}
+            if module == "header":
+                buttons = {f"nav-{index}": page_id for index, page_id in enumerate(page_ids)}
+                block["values"] = {
+                    "rightComponents": list(buttons),
+                    "components": {
+                        button: {
+                            "type": "button",
+                            "button": {"action": {"action": "page", "pageId": page_id}},
+                        }
+                        for button, page_id in buttons.items()
+                    },
+                }
+            if module == "newStore":
+                block["components"] = [
+                    {
+                        "enable": True,
+                        "section": {
+                            "item": {"group": section["external_id"], "type": section["type"]}
+                        },
+                        "card": {"selectedLayoutType": section["layout"]},
+                    }
+                    for section in plan["catalog_sections"]
+                ]
+            blocks.append(block)
+        page["blocks"] = blocks
+    return final
+
+
+class ObjectPagePathTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.brief = json.loads(EXAMPLE_BRIEF.read_text(encoding="utf-8"))
+
+    def run_apply(self, cli: FakeShopBuilderCli, plan: dict) -> tuple[int, str, str]:
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            argv = [
+                "apply_plan.py",
+                str(EXAMPLE_BRIEF),
+                "--approved-plan",
+                approved_plan_file(directory, plan),
+                "--confirmation-id",
+                plan["confirmation_id"],
+            ]
+            with (
+                mock.patch.dict(apply_plan.RUN_AUTH, {"logged_in": False, "context": None}),
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(apply_plan, "run_preflight"),
+                mock.patch.object(apply_plan, "cli_has_command", return_value=True),
+                mock.patch.object(apply_plan, "run_json", side_effect=cli),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                code = apply_plan.main()
+                self.recorded_context = apply_plan.RUN_AUTH["context"]
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_page_path_accepts_string_and_object_shapes(self) -> None:
+        self.assertEqual("/", apply_plan.page_path({"path": "/"}))
+        self.assertEqual("/news", apply_plan.page_path({"path": object_path("/news")}))
+        for page in (
+            {"path": {"type": "static"}},
+            {"path": {"pathSegment": 1}},
+            {"path": None},
+            {},
+            "/",
+            None,
+        ):
+            with self.subTest(page=page):
+                self.assertIsNone(apply_plan.page_path(page))
+
+    def test_page_for_path_resolves_mixed_path_shapes(self) -> None:
+        structure = {
+            "pages": [
+                {"_id": "home", "path": "/"},
+                {"_id": "store", "path": object_path("/store")},
+                {"_id": "unreadable", "path": {"type": "static"}},
+            ]
+        }
+        self.assertEqual("home", apply_plan.page_for_path(structure, "/")["_id"])
+        self.assertEqual("store", apply_plan.page_for_path(structure, "/store")["_id"])
+        self.assertIsNone(apply_plan.page_for_path(structure, "/about"))
+
+    def test_plan_binds_object_paths_and_reports_string_extra_pages(self) -> None:
+        structure = {
+            "_id": "landing",
+            "pages": [
+                {"_id": "home", "path": object_path("/"), "blocks": []},
+                {"_id": "legacy", "name": "Legacy", "path": "/legacy", "blocks": []},
+            ],
+        }
+        plan = apply_plan.build_plan(self.brief, structure)
+        self.assertEqual("home", plan["pages"][0]["page_id"])
+        self.assertEqual(
+            [{"page_id": "legacy", "name": "Legacy", "path": "/legacy"}],
+            plan["current_state"]["extra_pages"],
+        )
+
+    def test_plan_rejects_the_same_path_in_both_shapes(self) -> None:
+        structure = {
+            "pages": [
+                {"_id": "one", "path": "/", "blocks": []},
+                {"_id": "two", "path": object_path("/"), "blocks": []},
+            ]
+        }
+        with self.assertRaisesRegex(ValueError, "duplicate path /"):
+            apply_plan.build_plan(self.brief, structure)
+
+    def test_plan_rejects_a_page_without_a_readable_path(self) -> None:
+        structure = {"pages": [{"_id": "one", "path": {"type": "static"}, "blocks": []}]}
+        with self.assertRaisesRegex(ValueError, "object with a path"):
+            apply_plan.build_plan(self.brief, structure)
+
+    def test_new_landing_resolves_object_path_after_add_page(self) -> None:
+        cli = FakeShopBuilderCli(self.brief)
+        code, stdout, stderr = self.run_apply(cli, apply_plan.build_plan(self.brief))
+        self.assertEqual(0, code, stderr)
+        report = json.loads(stdout)
+        self.assertEqual("bootstrap-complete", report["status"])
+        self.assertEqual(["/"], report["created_pages"])
+        self.assertEqual(object_path("/"), cli.landing["pages"][0]["path"])
+        add_page = next(call for call in cli.calls if call[1] == "add-page")
+        self.assertEqual("/", add_page[add_page.index("--path") + 1])
+        project = self.brief["project"]
+        self.assertEqual(
+            {
+                "merchant_id": project["merchant_id"],
+                "project_id": project["project_id"],
+                "sandbox": project["environment"] == "sandbox",
+            },
+            self.recorded_context,
+        )
+
+    def test_rerun_on_object_path_landing_passes_plan_and_verify(self) -> None:
+        cli = FakeShopBuilderCli(self.brief)
+        code, _, stderr = self.run_apply(cli, apply_plan.build_plan(self.brief))
+        self.assertEqual(0, code, stderr)
+
+        plan = apply_plan.build_plan(self.brief, {"ok": True, "data": cli.landing})
+        self.assertEqual("page-1", plan["pages"][0]["page_id"])
+        self.assertEqual([], plan["current_state"]["extra_pages"])
+
+        final = reconciled_landing(cli.landing, plan)
+        self.assertEqual(object_path("/"), final["pages"][0]["path"])
+        result = verify_structure.verify(plan, {"ok": True, "data": final}, cli.module_of)
+        self.assertTrue(result["ok"], result["errors"])
+
+    def test_structure_verifier_reports_missing_object_path_page(self) -> None:
+        plan = {
+            "target": {"merchant_id": 100, "project_id": 200, "slug": "shop"},
+            "locales": ["en-US"],
+            "pages": [
+                {"path": "/", "blocks": ["header"]},
+                {"path": "/store", "blocks": ["header"]},
+            ],
+        }
+        structure = {
+            "merchantId": 100,
+            "projectId": 200,
+            "domain": "shop",
+            "type": "store",
+            "published": None,
+            "languages": ["en-US"],
+            "pages": [
+                {"path": object_path("/"), "blocks": [{"_id": "h", "module": "header"}]},
+                {"path": object_path("/about"), "blocks": [{"_id": "a", "module": "header"}]},
+            ],
+        }
+        result = verify_structure.verify(plan, structure)
+        self.assertIn(
+            "page paths differ: expected ['/', '/store'], got ['/', '/about']",
+            result["errors"],
+        )
+
+
+class CustomCodeReportTests(unittest.TestCase):
+    def apply_to_existing_site(
+        self, blocks: list[str], hidden_by_run: list[str] | None = None
+    ) -> dict:
+        brief = json.loads(EXAMPLE_BRIEF.read_text(encoding="utf-8"))
+        brief["content"]["page_overrides"] = [
+            {"name": "Home", "path": "/", "blocks": blocks}
+        ]
+        slug = brief["site"]["slug"]
+        cli = FakeShopBuilderCli(brief)
+        cli("shopbuilder", "create-website", "--name", "Shop", "--slug", slug, "--type", "topup")
+        cli("shopbuilder", "set-landing-type", "--slug", slug, "--type", "store")
+        cli("shopbuilder", "add-page", "--slug", slug, "--name", "Home", "--path", "/")
+        saved = copy.deepcopy(cli.landing)
+        plan = apply_plan.build_plan(brief, saved)
+
+        def reconciled(slug: str, landing_id: str, page: dict) -> dict:
+            return {
+                "path": page["path"],
+                "page_id": page["page_id"],
+                "blocks": page["blocks"],
+                "removed_blocks": 0,
+                "hidden_custom_code": hidden_by_run or [],
+            }
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            brief_path = Path(directory) / "brief.json"
+            brief_path.write_text(json.dumps(brief), encoding="utf-8")
+            argv = [
+                "apply_plan.py",
+                str(brief_path),
+                "--approved-plan",
+                approved_plan_file(directory, plan),
+                "--confirmation-id",
+                plan["confirmation_id"],
+                "--backup-dir",
+                directory,
+            ]
+            with (
+                mock.patch.dict(apply_plan.RUN_AUTH, {"logged_in": False, "context": None}),
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(apply_plan, "run_preflight"),
+                mock.patch.object(apply_plan, "cli_has_command", return_value=True),
+                mock.patch.object(apply_plan, "run_json", side_effect=cli),
+                mock.patch.object(apply_plan, "verified_backup", return_value=True),
+                mock.patch.object(apply_plan, "backup_structure", return_value=saved),
+                mock.patch.object(apply_plan, "reconcile_page", side_effect=reconciled),
+                mock.patch.object(apply_plan, "apply_navigation", return_value=[]),
+                mock.patch.object(apply_plan, "wire_catalog_sections", return_value=[]),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                code = apply_plan.main()
+        self.assertEqual(0, code, stderr.getvalue())
+        return json.loads(stdout.getvalue())
+
+    def test_final_report_tells_the_user_to_fill_custom_code(self) -> None:
+        report = self.apply_to_existing_site(
+            ["header", "html", "footer"], hidden_by_run=["new-html"]
+        )
+        self.assertEqual("implemented-phases-applied", report["status"])
+        self.assertEqual(
+            [
+                "The Custom code block is added empty and hidden; paste your code and "
+                "make the block visible in the Site Builder editor."
+            ],
+            report["warnings"],
+        )
+
+    def test_final_report_has_no_custom_code_line_for_a_block_already_there(self) -> None:
+        report = self.apply_to_existing_site(["header", "html", "footer"], hidden_by_run=[])
+        self.assertEqual([], report["warnings"])
+
+    def test_final_report_has_no_custom_code_line_without_the_block(self) -> None:
+        report = self.apply_to_existing_site(["header", "footer"])
+        self.assertEqual([], report["warnings"])
+
+
+class FakePage:
+    """One landing page whose blocks change with add-block, move-block and update-block."""
+
+    def __init__(self, blocks: list[dict], apply_hidden: bool = True) -> None:
+        self.blocks = blocks
+        self.apply_hidden = apply_hidden
+        self.updates: list[dict] = []
+
+    def structure(self, slug: str) -> dict:
+        return {
+            "pages": [
+                {"_id": "home", "path": object_path("/"), "blocks": copy.deepcopy(self.blocks)}
+            ]
+        }
+
+    def run_json(self, *args: str) -> object:
+        options = dict(zip(args[2::2], args[3::2]))
+        if args[1] == "add-block":
+            module = options["--block"]
+            self.blocks.append({"_id": f"new-{module}", "module": module, "hidden": False})
+        elif args[1] == "move-block":
+            block = self.blocks.pop(int(options["--source"]))
+            self.blocks.insert(int(options["--destination"]), block)
+        elif args[1] == "update-block":
+            payload = json.loads(options["--data"])
+            self.updates.append(payload)
+            for change in payload.values():
+                for block in self.blocks:
+                    if block["_id"] == change["id"] and self.apply_hidden:
+                        for patch in change["patches"]:
+                            block[patch["path"][0]] = patch["value"]
+        else:
+            raise AssertionError(f"unexpected CLI call: {args}")
+        return {"ok": True}
+
+    def reconcile(self, desired: list[str]) -> dict:
+        plan = {"name": "Home", "path": "/", "blocks": desired, "removals": []}
+        with (
+            mock.patch.object(apply_plan, "structure", side_effect=self.structure),
+            mock.patch.object(apply_plan, "run_json", side_effect=self.run_json),
+        ):
+            return apply_plan.reconcile_page("shop", "landing", plan)
+
+
+class CustomCodeHidingTests(unittest.TestCase):
+    def test_reconciliation_hides_the_custom_code_block_it_adds(self) -> None:
+        page = FakePage(
+            [
+                {"_id": "header", "module": "header", "hidden": False},
+                {"_id": "footer", "module": "footer", "hidden": False},
+            ]
+        )
+        result = page.reconcile(["header", "html", "footer"])
+        self.assertEqual(["new-html"], result["hidden_custom_code"])
+        self.assertEqual(["header", "html", "footer"], result["blocks"])
+        self.assertEqual(
+            [
+                {
+                    "hideCustomCode": {
+                        "type": "block",
+                        "id": "new-html",
+                        "patches": [{"op": "replace", "path": ["hidden"], "value": True}],
+                    }
+                }
+            ],
+            page.updates,
+        )
+        self.assertTrue(next(b for b in page.blocks if b["_id"] == "new-html")["hidden"])
+
+    def test_reconciliation_leaves_an_existing_custom_code_block_as_set(self) -> None:
+        page = FakePage(
+            [
+                {"_id": "header", "module": "header", "hidden": False},
+                {"_id": "user-code", "module": "html", "hidden": False},
+                {"_id": "footer", "module": "footer", "hidden": False},
+            ]
+        )
+        result = page.reconcile(["header", "html", "faq", "footer"])
+        self.assertEqual([], result["hidden_custom_code"])
+        self.assertEqual([], page.updates)
+        self.assertFalse(next(b for b in page.blocks if b["_id"] == "user-code")["hidden"])
+
+    def test_reconciliation_stops_when_the_new_custom_code_block_stays_visible(self) -> None:
+        page = FakePage(
+            [
+                {"_id": "header", "module": "header", "hidden": False},
+                {"_id": "footer", "module": "footer", "hidden": False},
+            ],
+            apply_hidden=False,
+        )
+        with self.assertRaisesRegex(RuntimeError, "could not hide the new Custom code block"):
+            page.reconcile(["header", "html", "footer"])
+
+
+class FakePreflightCli:
+    """Read-only `xsolla` stand-in for preflight; any other call fails the test."""
+
+    def __init__(self, site: dict | None = None, modules: dict | None = None) -> None:
+        self.site = site
+        self.modules = modules or {}
+        self.calls: list[tuple[str, ...]] = []
+
+    def __call__(self, *args: str) -> object:
+        self.calls.append(args)
+        if args == ("config", "list"):
+            return {"merchant_id": 12345, "project_id": 67890}
+        if args == ("auth", "list-account"):
+            return {
+                "accounts": [{"context": "publisher", "active": True, "expired": False}]
+            }
+        if args[:2] == ("shopbuilder", "list-websites"):
+            sites = [{"_id": "landing-1", "domain": "space-legends-shop"}]
+            return {"ok": True, "data": sites if self.site else []}
+        if args[:2] == ("shopbuilder", "get-structure"):
+            return {"ok": True, "data": copy.deepcopy(self.site)}
+        if args[:2] == ("shopbuilder", "get-block"):
+            return {"ok": True, "data": {"module": self.modules[args[-1]]}}
+        if args[:2] == ("catalog", "list-item-groups"):
+            return {"ok": True, "data": []}
+        raise AssertionError(f"unexpected CLI call: {args}")
+
+
+class CommonLayoutPreflightTests(unittest.TestCase):
+    def run_preflight(
+        self, cli: FakePreflightCli, has_create_block: bool
+    ) -> tuple[int, str, str, mock.Mock]:
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(sys, "argv", ["preflight.py", str(EXAMPLE_BRIEF)]),
+            mock.patch.object(preflight.shutil, "which", return_value="xsolla"),
+            mock.patch.object(
+                preflight,
+                "approved_test_project",
+                return_value={"approval_reference": "test approval"},
+            ),
+            mock.patch.object(preflight, "run_json", side_effect=cli),
+            mock.patch.object(
+                preflight, "cli_has_command", return_value=has_create_block
+            ) as has_command,
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            code = preflight.main()
+        return code, stdout.getvalue(), stderr.getvalue(), has_command
+
+    def test_new_site_on_cli_without_create_block_skips_the_layout_step(self) -> None:
+        cli = FakePreflightCli()
+        code, stdout, stderr, has_command = self.run_preflight(cli, has_create_block=False)
+        self.assertEqual(0, code, stderr)
+        self.assertIn(
+            "the common layout needs a newer Xsolla CLI; the site is built without it. A site "
+            "without the common layout won't open in the Editor, Publish or private preview",
+            stderr,
+        )
+        self.assertEqual("skip", json.loads(stdout)["target"]["layout_step"])
+        has_command.assert_called_once_with("shopbuilder", "create-block")
+
+    def test_new_site_on_cli_with_create_block_passes(self) -> None:
+        code, stdout, stderr, _ = self.run_preflight(
+            FakePreflightCli(), has_create_block=True
+        )
+        self.assertEqual(0, code, stderr)
+        target = json.loads(stdout)["target"]
+        self.assertIsNone(target["common_layout_id"])
+        self.assertEqual("create", target["layout_step"])
+
+    def test_existing_site_without_common_layout_skips_without_create_block(self) -> None:
+        site = {"pages": [], "layouts": ["side-id"], "blocks": ["side-id"]}
+        cli = FakePreflightCli(site, {"side-id": "side-by-side-layout"})
+        code, stdout, stderr, _ = self.run_preflight(cli, has_create_block=False)
+        self.assertEqual(0, code, stderr)
+        self.assertEqual("skip", json.loads(stdout)["target"]["layout_step"])
+
+    def test_partner_site_with_common_layout_passes_without_create_block(self) -> None:
+        site = {
+            "pages": [],
+            "layouts": ["side-id", "common-id"],
+            "blocks": ["side-id", "common-id"],
+        }
+        cli = FakePreflightCli(
+            site, {"side-id": "side-by-side-layout", "common-id": "common-layout"}
+        )
+        code, stdout, stderr, has_command = self.run_preflight(
+            cli, has_create_block=False
+        )
+        self.assertEqual(0, code, stderr)
+        target = json.loads(stdout)["target"]
+        self.assertEqual("common-id", target["common_layout_id"])
+        self.assertEqual("present", target["layout_step"])
+        has_command.assert_not_called()
+        self.assertNotIn("create-block", [call[1] for call in cli.calls])
+
+    def test_apply_stops_before_any_write_when_preflight_fails(self) -> None:
+        stderr = io.StringIO()
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        plan = apply_plan.build_plan(json.loads(EXAMPLE_BRIEF.read_text(encoding="utf-8")))
+        argv = [
+            "apply_plan.py",
+            str(EXAMPLE_BRIEF),
+            "--approved-plan",
+            approved_plan_file(directory.name, plan),
+            "--confirmation-id",
+            plan["confirmation_id"],
+        ]
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch.object(
+                apply_plan,
+                "run_preflight",
+                side_effect=RuntimeError("CLI sandbox must be disabled for Shop Builder"),
+            ),
+            mock.patch.object(apply_plan, "run_json") as run_json,
+            contextlib.redirect_stderr(stderr),
+        ):
+            self.assertEqual(1, apply_plan.main())
+        self.assertIn("CLI sandbox must be disabled", stderr.getvalue())
+        run_json.assert_not_called()
+
+    def test_cli_has_command_reads_the_usage_line(self) -> None:
+        group_help = "shopbuilder API commands\n\nUsage:\n  xsolla shopbuilder [flags]\n"
+        command_help = "Add a block\n\nUsage:\n  xsolla shopbuilder create-block [flags]\n"
+        for stdout, expected in ((group_help, False), (command_help, True)):
+            with self.subTest(expected=expected):
+                result = mock.Mock(returncode=0, stdout=stdout, stderr="")
+                with mock.patch.object(
+                    preflight.subprocess, "run", return_value=result
+                ) as run:
+                    self.assertIs(
+                        expected, preflight.cli_has_command("shopbuilder", "create-block")
+                    )
+                self.assertEqual(
+                    ["xsolla", "shopbuilder", "create-block", "--help"],
+                    run.call_args.args[0],
+                )
+
+
+NO_OWN_HEADER = (
+    "Page / has no header block of its own. Sites created from a Publisher Account "
+    "template keep the header in the common layout, and assembly can't build on them "
+    "yet. Nothing was written."
+)
+READ_COMMANDS = {
+    ("config", "list"),
+    ("shopbuilder", "list-websites"),
+    ("shopbuilder", "get-structure"),
+    ("shopbuilder", "get-block"),
+}
+
+
+def publisher_template_site(brief: dict, own_header: bool = False) -> tuple[dict, dict]:
+    """Masked get-structure of a site created from a Publisher Account template.
+
+    The shape comes from a real export; IDs, copy and account data are replaced.
+    Page "/" has no header of its own: the header and footer sit in the common
+    layout. Returns the structure and the modules get-block reports for site blocks.
+    """
+    page_blocks = [
+        ("lead", None),
+        ("newStore", None),
+        ("federated", "sb-daily-reward"),
+        ("federated", "sb-offer-chain"),
+        ("newStore", None),
+        ("rewards", None),
+        ("newStore", None),
+        ("promocodes", None),
+        ("federated", "offerwall-block"),
+        ("faq", None),
+        ("lead", None),
+    ]
+    if own_header:
+        page_blocks.insert(0, ("header", None))
+    blocks = []
+    for index, (module, federated_id) in enumerate(page_blocks, start=1):
+        block = {"_id": f"page-block-{index}", "module": module, "hidden": False}
+        if federated_id is not None:
+            block["values"] = {"blockId": federated_id}
+        blocks.append(block)
+    site_modules = {
+        "layout-header": "header",
+        "layout-footer": "footer",
+        "layout-1": "common-layout",
+    }
+    site = {
+        "_id": "landing-1",
+        "domain": brief["site"]["slug"],
+        "merchantId": brief["project"]["merchant_id"],
+        "projectId": brief["project"]["project_id"],
+        "type": "store",
+        "published": None,
+        "languages": ["en-US"],
+        "pages": [
+            {
+                "_id": "page-1",
+                "name": "Main page",
+                "path": object_path("/"),
+                "blocks": blocks,
+            }
+        ],
+        "layouts": ["layout-1"],
+        "blocks": [block["_id"] for block in blocks] + list(site_modules),
+    }
+    return site, site_modules
+
+
+class PublisherTemplateSiteTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.brief = json.loads(EXAMPLE_BRIEF.read_text(encoding="utf-8"))
+
+    def fake_cli(self, own_header: bool) -> FakeShopBuilderCli:
+        cli = FakeShopBuilderCli(self.brief)
+        cli.landing, cli.site_modules = publisher_template_site(self.brief, own_header)
+        return cli
+
+    def run_render(self, site: dict) -> tuple[int, str, str]:
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            structure_path = Path(directory) / "structure.json"
+            structure_path.write_text(
+                json.dumps({"ok": True, "data": site}), encoding="utf-8"
+            )
+            argv = ["render_plan.py", str(EXAMPLE_BRIEF), "--structure", str(structure_path)]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                code = render_plan.main()
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def run_apply(self, cli: FakeShopBuilderCli) -> tuple[int, str, str, mock.Mock]:
+        saved = copy.deepcopy(cli.landing)
+        plan = apply_plan.build_plan(self.brief, saved)
+
+        def reconciled(slug: str, landing_id: str, page: dict) -> dict:
+            return {
+                "path": page["path"],
+                "page_id": page["page_id"],
+                "blocks": page["blocks"],
+                "removed_blocks": len(page["removals"]),
+                "hidden_custom_code": [],
+            }
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            argv = [
+                "apply_plan.py",
+                str(EXAMPLE_BRIEF),
+                "--approved-plan",
+                approved_plan_file(directory, plan),
+                "--confirmation-id",
+                plan["confirmation_id"],
+                "--backup-dir",
+                directory,
+            ]
+            with (
+                mock.patch.dict(apply_plan.RUN_AUTH, {"logged_in": False, "context": None}),
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(apply_plan, "run_preflight"),
+                mock.patch.object(apply_plan, "run_json", side_effect=cli),
+                mock.patch.object(apply_plan, "verified_backup", return_value=True),
+                mock.patch.object(apply_plan, "backup_structure", return_value=saved),
+                mock.patch.object(
+                    apply_plan, "reconcile_page", side_effect=reconciled
+                ) as reconcile,
+                mock.patch.object(apply_plan, "apply_navigation", return_value=[]),
+                mock.patch.object(apply_plan, "wire_catalog_sections", return_value=[]),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                code = apply_plan.main()
+        return code, stdout.getvalue(), stderr.getvalue(), reconcile
+
+    def writes(self, cli: FakeShopBuilderCli) -> list[tuple[str, ...]]:
+        return [call for call in cli.calls if call[:2] not in READ_COMMANDS]
+
+    def test_render_refuses_a_page_whose_header_is_in_the_common_layout(self) -> None:
+        site, _ = publisher_template_site(self.brief)
+        code, stdout, stderr = self.run_render(site)
+        self.assertEqual(1, code)
+        self.assertEqual("", stdout)
+        self.assertEqual(NO_OWN_HEADER + "\n", stderr)
+
+    def test_apply_stops_with_no_write_when_the_header_is_in_the_common_layout(self) -> None:
+        cli = self.fake_cli(own_header=False)
+        code, stdout, stderr, reconcile = self.run_apply(cli)
+        self.assertEqual(1, code)
+        self.assertEqual("", stdout)
+        self.assertEqual(f"Apply failed: {NO_OWN_HEADER}\n", stderr)
+        self.assertEqual([], self.writes(cli))
+        slug = self.brief["site"]["slug"]
+        self.assertIn(("shopbuilder", "get-structure", "--slug", slug), cli.calls)
+        reconcile.assert_not_called()
+
+    def test_site_whose_page_has_its_own_header_renders_and_applies(self) -> None:
+        site, _ = publisher_template_site(self.brief, own_header=True)
+        code, stdout, stderr = self.run_render(site)
+        self.assertEqual(0, code, stderr)
+        self.assertEqual("page-1", json.loads(stdout)["pages"][0]["page_id"])
+
+        cli = self.fake_cli(own_header=True)
+        code, stdout, stderr, reconcile = self.run_apply(cli)
+        self.assertEqual(0, code, stderr)
+        self.assertEqual("implemented-phases-applied", json.loads(stdout)["status"])
+        self.assertEqual(["/"], [call.args[2]["path"] for call in reconcile.call_args_list])
+
+    def test_only_pages_already_on_the_site_need_their_own_header(self) -> None:
+        site, _ = publisher_template_site(self.brief, own_header=True)
+        pages = [{"path": "/"}, {"path": "/store"}]
+        render_plan.require_own_header(pages, site)
+        site["pages"][0]["blocks"].pop(0)
+        with self.assertRaisesRegex(ValueError, "^Page / has no header block of its own"):
+            render_plan.require_own_header(pages, site)
+
+
+WRITE_COMMANDS = {
+    "create-website",
+    "set-landing-type",
+    "add-page",
+    "add-language",
+    "create-block",
+    "add-block",
+    "move-block",
+    "update-block",
+}
+
+
+class OneApprovalTests(unittest.TestCase):
+    """A new site's second run reuses the developer's yes only when the plan is covered."""
+
+    def setUp(self) -> None:
+        self.brief = json.loads(EXAMPLE_BRIEF.read_text(encoding="utf-8"))
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.approved = apply_plan.build_plan(self.brief)
+        self.approved_path = self.root / "approved-plan.json"
+        self.approved_path.write_text(json.dumps(self.approved, indent=2), encoding="utf-8")
+        self.cli = FakeShopBuilderCli(self.brief)
+
+    def apply(
+        self, *extra: str, brief: dict | None = None, confirmation_id: str | None = None
+    ) -> tuple[int, dict | None, str, mock.Mock]:
+        brief_path = self.root / "brief.json"
+        brief_path.write_text(json.dumps(brief or self.brief), encoding="utf-8")
+        argv = [
+            "apply_plan.py",
+            str(brief_path),
+            "--approved-plan",
+            str(self.approved_path),
+            "--confirmation-id",
+            confirmation_id or self.approved["confirmation_id"],
+            *extra,
+        ]
+        backup = copy.deepcopy(self.cli.landing)
+
+        def reconciled(slug: str, landing_id: str, page: dict) -> dict:
+            return {
+                "path": page["path"],
+                "page_id": page["page_id"],
+                "blocks": page["blocks"],
+                "removed_blocks": len(page["removals"]),
+                "added_block_ids": [],
+                "hidden_custom_code": [],
+            }
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.dict(apply_plan.RUN_AUTH, {"logged_in": False, "context": None}),
+            mock.patch.object(sys, "argv", argv),
+            mock.patch.object(apply_plan, "run_preflight"),
+            mock.patch.object(apply_plan, "cli_has_command", return_value=True),
+            mock.patch.object(apply_plan, "run_json", side_effect=self.cli),
+            mock.patch.object(apply_plan, "verified_backup", return_value=True),
+            mock.patch.object(apply_plan, "backup_structure", return_value=backup),
+            mock.patch.object(
+                apply_plan, "reconcile_page", side_effect=reconciled
+            ) as reconcile,
+            mock.patch.object(apply_plan, "apply_navigation", return_value=[]),
+            mock.patch.object(apply_plan, "wire_catalog_sections", return_value=[]),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            code = apply_plan.main()
+        report = json.loads(stdout.getvalue()) if code == 0 else None
+        return code, report, stderr.getvalue(), reconcile
+
+    def bootstrap(self) -> Path:
+        code, report, stderr, _ = self.apply()
+        self.assertEqual(0, code, stderr)
+        path = self.root / "run1-report.json"
+        path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        return path
+
+    def writes(self) -> list[tuple[str, ...]]:
+        return [call for call in self.cli.calls if call[1:2] and call[1] in WRITE_COMMANDS]
+
+    def test_bootstrap_plan_shows_template_removals_and_the_public_preview(self) -> None:
+        home = self.approved["pages"][0]
+        self.assertEqual(
+            [m for m in render_plan.NEW_PAGE_TEMPLATE if m not in home["blocks"]],
+            home["template_removals"],
+        )
+        self.assertIn("faq", home["template_removals"])
+        self.assertEqual("anyone with the link", self.approved["preview"]["access"])
+
+    def test_bootstrap_report_lists_the_blocks_it_created(self) -> None:
+        report = json.loads(self.bootstrap().read_text(encoding="utf-8"))
+        self.assertEqual("bootstrap-complete", report["status"])
+        self.assertEqual(self.approved["confirmation_id"], report["approved_confirmation_id"])
+        self.assertEqual(
+            {"/": ["scaffold-header", "scaffold-footer"]}, report["created_blocks"]
+        )
+
+    def test_second_run_under_the_same_yes_applies_a_covered_plan(self) -> None:
+        run_report = self.bootstrap()
+        code, report, stderr, reconcile = self.apply(
+            "--run-report", str(run_report), "--backup-dir", str(self.root)
+        )
+        self.assertEqual(0, code, stderr)
+        self.assertEqual("implemented-phases-applied", report["status"])
+        self.assertEqual(self.approved["confirmation_id"], report["approved_confirmation_id"])
+        self.assertNotEqual(self.approved["confirmation_id"], report["confirmation_id"])
+        self.assertEqual(1, reconcile.call_count)
+
+    def test_second_run_refuses_to_remove_a_block_the_plan_never_showed(self) -> None:
+        run_report = self.bootstrap()
+        self.cli.landing["pages"][0]["blocks"].insert(
+            1, {"_id": "user-html", "module": "html"}
+        )
+        writes_before = len(self.writes())
+        code, _, stderr, reconcile = self.apply(
+            "--run-report", str(run_report), "--backup-dir", str(self.root)
+        )
+        self.assertEqual(1, code)
+        self.assertIn("removes the html block user-html on /", stderr)
+        self.assertIn("Nothing was written", stderr)
+        reconcile.assert_not_called()
+        self.assertEqual(writes_before, len(self.writes()))
+
+    def test_apply_requires_the_approved_plan(self) -> None:
+        argv = [
+            "apply_plan.py",
+            str(EXAMPLE_BRIEF),
+            "--confirmation-id",
+            self.approved["confirmation_id"],
+        ]
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch.object(apply_plan, "run_json", side_effect=self.cli),
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+            self.assertRaises(SystemExit),
+        ):
+            apply_plan.main()
+        self.assertIn("--approved-plan", stderr.getvalue())
+        self.assertEqual([], self.cli.calls)
+
+    def test_a_re_rendered_plan_saved_as_the_approved_one_is_refused(self) -> None:
+        run_report = self.bootstrap()
+        self.cli.landing["pages"][0]["blocks"].insert(
+            1, {"_id": "user-html", "module": "html"}
+        )
+        report = json.loads(run_report.read_text(encoding="utf-8"))
+        rerendered = render_plan.build_plan(
+            self.brief, self.cli.landing, render_plan.created_block_ids(report)
+        )
+        self.assertIn("user-html", [r["block_id"] for r in rerendered["pages"][0]["removals"]])
+        self.approved_path.write_text(json.dumps(rerendered), encoding="utf-8")
+        writes_before = len(self.writes())
+        code, _, stderr, reconcile = self.apply(
+            "--run-report",
+            str(run_report),
+            "--backup-dir",
+            str(self.root),
+            confirmation_id=rerendered["confirmation_id"],
+        )
+        self.assertEqual(1, code)
+        self.assertIn("the run report belongs to another approval", stderr)
+        reconcile.assert_not_called()
+        self.assertEqual(writes_before, len(self.writes()))
+
+    def test_second_run_without_the_first_runs_report_needs_a_new_yes(self) -> None:
+        self.bootstrap()
+        code, _, stderr, reconcile = self.apply("--backup-dir", str(self.root))
+        self.assertEqual(1, code)
+        self.assertIn("pass the earlier run's report", stderr)
+        reconcile.assert_not_called()
+
+    def test_second_run_with_a_changed_brief_needs_a_new_yes(self) -> None:
+        run_report = self.bootstrap()
+        changed = copy.deepcopy(self.brief)
+        changed["catalog"]["groups"][0]["placement"] = "secondary"
+        code, _, stderr, reconcile = self.apply(
+            "--run-report", str(run_report), "--backup-dir", str(self.root), brief=changed
+        )
+        self.assertEqual(1, code)
+        self.assertIn("the catalog sections changed", stderr)
+        self.assertIn("the shop brief changed", stderr)
+        reconcile.assert_not_called()
+
+    def test_an_edited_approved_plan_is_refused_before_any_call(self) -> None:
+        edited = copy.deepcopy(self.approved)
+        edited["pages"][0]["blocks"].remove("newStore")
+        self.approved_path.write_text(json.dumps(edited), encoding="utf-8")
+        code, _, stderr, _ = self.apply()
+        self.assertEqual(1, code)
+        self.assertIn("changed after it was rendered", stderr)
+        self.assertEqual([], self.cli.calls)
+
+    def test_confirmation_id_must_be_the_approved_plans(self) -> None:
+        code, _, stderr, _ = self.apply(confirmation_id="sha256:000000000000")
+        self.assertEqual(1, code)
+        self.assertIn("does not match the approved plan", stderr)
+        self.assertEqual([], self.writes())
+
+    def test_template_blocks_the_first_run_created_are_removed_not_preserved(self) -> None:
+        site = {
+            "_id": "landing-1",
+            "pages": [
+                {
+                    "_id": "page-1",
+                    "path": "/",
+                    "blocks": [
+                        {"_id": "t-header", "module": "header"},
+                        {"_id": "t-faq", "module": "faq"},
+                        {"_id": "t-footer", "module": "footer"},
+                    ],
+                }
+            ],
+        }
+        preserved = render_plan.build_plan(self.brief, site)["pages"][0]
+        self.assertEqual(["t-faq"], [b["block_id"] for b in preserved["preserved_blocks"]])
+
+        created = frozenset({"t-header", "t-faq", "t-footer"})
+        page = render_plan.build_plan(self.brief, site, created)["pages"][0]
+        self.assertEqual([], page["preserved_blocks"])
+        self.assertNotIn("faq", page["blocks"])
+        self.assertEqual(
+            [
+                {
+                    "block_id": "t-faq",
+                    "module": "faq",
+                    "reason": "template block on a page this assembly created",
+                }
+            ],
+            page["removals"],
+        )
+
+    def test_render_says_whether_the_approval_covers_the_plan(self) -> None:
+        run_report = self.bootstrap()
+        structure_path = self.root / "structure.json"
+
+        def render() -> str:
+            structure_path.write_text(json.dumps(self.cli.landing), encoding="utf-8")
+            argv = [
+                "render_plan.py",
+                str(EXAMPLE_BRIEF),
+                "--structure",
+                str(structure_path),
+                "--approved-plan",
+                str(self.approved_path),
+                "--run-report",
+                str(run_report),
+            ]
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", argv),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(stderr),
+            ):
+                self.assertEqual(0, render_plan.main())
+            return stderr.getvalue()
+
+        self.assertEqual("Covered by the approved plan.\n", render())
+        self.cli.landing["pages"][0]["blocks"].insert(
+            1, {"_id": "user-html", "module": "html"}
+        )
+        self.assertIn("Needs a new yes: it removes the html block user-html on /", render())
+
+        report = json.loads(run_report.read_text(encoding="utf-8"))
+        rerendered = render_plan.build_plan(
+            self.brief, self.cli.landing, render_plan.created_block_ids(report)
+        )
+        self.approved_path.write_text(json.dumps(rerendered), encoding="utf-8")
+        self.assertEqual(
+            "Needs a new yes: the run report belongs to another approval\n", render()
+        )
+
+
+def load_patch_backgrounds():
+    path = ROOT / "scripts" / "patch_backgrounds.py"
+    spec = importlib.util.spec_from_file_location("patch_backgrounds_for_tests", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+patch_backgrounds = load_patch_backgrounds()
+
+
+class BackgroundFixTests(unittest.TestCase):
+    """Background fixes after the visual review touch only blocks the assembly created."""
+
+    def setUp(self) -> None:
+        self.brief = json.loads(EXAMPLE_BRIEF.read_text(encoding="utf-8"))
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        approved = apply_plan.build_plan(self.brief)
+        (self.root / "approved-plan.json").write_text(json.dumps(approved), encoding="utf-8")
+        (self.root / "brief.json").write_text(json.dumps(self.brief), encoding="utf-8")
+        report = {
+            "operation_succeeded": True,
+            "approved_confirmation_id": approved["confirmation_id"],
+            "slug": self.brief["site"]["slug"],
+            "landing_id": "landing-1",
+            "created_blocks": {"/": ["new-hero"]},
+        }
+        (self.root / "run1-report.json").write_text(json.dumps(report), encoding="utf-8")
+        self.uploaded = "https://cdn.example/landing-1/hero.webp"
+        (self.root / "assets.json").write_text(
+            json.dumps({"ok": True, "data": [{"url": self.uploaded, "type": "image"}]}),
+            encoding="utf-8",
+        )
+        background = {"enable": True, "type": "color", "color": "rgba(0, 0, 0, 0)"}
+        self.site = {
+            "_id": "landing-1",
+            "pages": [
+                {
+                    "_id": "page-1",
+                    "path": "/",
+                    "blocks": [
+                        {
+                            "_id": "new-hero",
+                            "module": "leadGameSales",
+                            "values": {"background": dict(background)},
+                        },
+                        {
+                            "_id": "old-faq",
+                            "module": "faq",
+                            "values": {
+                                "background": {
+                                    **background,
+                                    "gradient": {"angle": 180, "from": "#000", "to": "#222"},
+                                }
+                            },
+                        },
+                    ],
+                }
+            ],
+        }
+        self.calls: list[tuple[str, ...]] = []
+
+    def cli(self, *args: str) -> dict:
+        self.calls.append(args)
+        change = json.loads(args[args.index("--data") + 1])["background"]
+        block = next(
+            block
+            for page in self.site["pages"]
+            for block in page["blocks"]
+            if block["_id"] == change["id"]
+        )
+        for patch in change["patches"]:
+            block["values"]["background"][patch["path"][-1]] = patch["value"]
+        return {"ok": True, "data": {}}
+
+    def run_fixes(self, fixes: list[dict], backup: dict | None = None) -> tuple[int, str]:
+        (self.root / "fixes.json").write_text(json.dumps(fixes), encoding="utf-8")
+        argv = [
+            "patch_backgrounds.py",
+            str(self.root / "brief.json"),
+            "--approved-plan",
+            str(self.root / "approved-plan.json"),
+            "--run-report",
+            str(self.root / "run1-report.json"),
+            "--backup-dir",
+            str(self.root),
+            "--fixes",
+            str(self.root / "fixes.json"),
+        ]
+        saved = copy.deepcopy(self.site if backup is None else backup)
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch.object(patch_backgrounds, "run_preflight"),
+            mock.patch.object(patch_backgrounds, "check_cli_context"),
+            mock.patch.object(patch_backgrounds, "verified_backup", return_value=True),
+            mock.patch.object(patch_backgrounds, "backup_structure", return_value=saved),
+            mock.patch.object(
+                patch_backgrounds, "structure", side_effect=lambda slug: copy.deepcopy(self.site)
+            ),
+            mock.patch.object(patch_backgrounds, "run_json", side_effect=self.cli),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(stderr),
+        ):
+            code = patch_backgrounds.main()
+        return code, stderr.getvalue()
+
+    def test_patches_a_background_leaf_on_a_block_the_assembly_created(self) -> None:
+        tint = "rgba(10, 12, 40, 0.6)"
+        code, stderr = self.run_fixes(
+            [{"block_id": "new-hero", "leaf": "color", "value": tint}]
+        )
+        self.assertEqual(0, code, stderr)
+        self.assertEqual(1, len(self.calls))
+        change = json.loads(self.calls[0][self.calls[0].index("--data") + 1])["background"]
+        self.assertEqual(
+            [{"op": "replace", "path": ["values", "background", "color"], "value": tint}],
+            change["patches"],
+        )
+        self.assertEqual(tint, self.site["pages"][0]["blocks"][0]["values"]["background"]["color"])
+
+    def test_refuses_a_block_that_existed_before_the_assembly(self) -> None:
+        code, stderr = self.run_fixes(
+            [{"block_id": "old-faq", "leaf": "color", "value": "#000000"}]
+        )
+        self.assertEqual(1, code)
+        self.assertIn("old-faq existed before this assembly", stderr)
+        self.assertEqual([], self.calls)
+
+    def test_refuses_anything_but_a_background_leaf(self) -> None:
+        code, stderr = self.run_fixes([{"block_id": "new-hero", "leaf": "title", "value": "x"}])
+        self.assertEqual(1, code)
+        self.assertIn("anything else needs a new yes", stderr)
+        self.assertEqual([], self.calls)
+
+    def test_an_image_must_be_uploaded_to_the_site(self) -> None:
+        code, stderr = self.run_fixes(
+            [{"block_id": "new-hero", "leaf": "img", "value": "https://elsewhere.example/a.png"}]
+        )
+        self.assertEqual(1, code)
+        self.assertIn("img is not an asset of this site", stderr)
+        self.assertEqual([], self.calls)
+
+        code, stderr = self.run_fixes(
+            [{"block_id": "new-hero", "leaf": "img", "value": self.uploaded}]
+        )
+        self.assertEqual(0, code, stderr)
+        self.assertEqual(
+            self.uploaded, self.site["pages"][0]["blocks"][0]["values"]["background"]["img"]
+        )
+
+    def test_a_gradient_must_have_the_shape_of_one_on_the_site(self) -> None:
+        code, stderr = self.run_fixes(
+            [{"block_id": "new-hero", "leaf": "gradient", "value": {"css": "linear-gradient()"}}]
+        )
+        self.assertEqual(1, code)
+        self.assertIn("gradient doesn't match the shape", stderr)
+        self.assertEqual([], self.calls)
+
+        fade = {"angle": 180, "from": "#101030", "to": "rgba(16, 16, 48, 0)"}
+        code, stderr = self.run_fixes([{"block_id": "new-hero", "leaf": "gradient", "value": fade}])
+        self.assertEqual(0, code, stderr)
+        change = json.loads(self.calls[0][self.calls[0].index("--data") + 1])["background"]
+        self.assertEqual(
+            [{"op": "add", "path": ["values", "background", "gradient"], "value": fade}],
+            change["patches"],
+        )
+
+    def test_refuses_when_the_site_changed_after_the_backup(self) -> None:
+        older = copy.deepcopy(self.site)
+        older["pages"][0]["blocks"].pop()
+        code, stderr = self.run_fixes(
+            [{"block_id": "new-hero", "leaf": "color", "value": "#000000"}], backup=older
+        )
+        self.assertEqual(1, code)
+        self.assertIn("changed after the backup", stderr)
+        self.assertEqual([], self.calls)
+
+
+if __name__ == "__main__":
+    unittest.main()
