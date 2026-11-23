@@ -1,0 +1,468 @@
+from __future__ import annotations
+
+import copy
+import contextlib
+import importlib.util
+import io
+import json
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+
+
+def load_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+validator = load_module(
+    "validate_shop_brief", ROOT / "scripts" / "validate_shop_brief.py"
+)
+render_plan = load_module("render_plan", ROOT / "scripts" / "render_plan.py")
+preflight = load_module("preflight", ROOT / "scripts" / "preflight.py")
+backup_shop = load_module("backup_shop", ROOT / "scripts" / "backup_shop.py")
+
+LAYOUT_WARNING = (
+    "The common layout needs a newer Xsolla CLI, so the site is built without it. A "
+    "site without the common layout won't open in the Editor, Publish or private preview."
+)
+
+
+class ShopBriefTests(unittest.TestCase):
+    def test_numeric_string_project_ids_load_as_integers(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "brief.json"
+            path.write_text(json.dumps({"project": {"merchant_id": "12", "project_id": "34"}}))
+            brief = validator.load_brief(path)
+        self.assertEqual({"merchant_id": 12, "project_id": 34}, brief["project"])
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "brief.json"
+            path.write_text(json.dumps({"project": {"merchant_id": "-1", "project_id": "1e3"}}))
+            brief = validator.load_brief(path)
+        self.assertEqual({"merchant_id": "-1", "project_id": "1e3"}, brief["project"])
+
+    def setUp(self) -> None:
+        self.brief = json.loads(
+            (ROOT / "examples" / "mobile-single-page.json").read_text(encoding="utf-8")
+        )
+
+    def test_example_is_valid_and_selects_mobile(self) -> None:
+        self.assertEqual([], validator.validate(self.brief))
+        self.assertEqual("mobile-single-page", render_plan.choose_preset(self.brief))
+
+    def test_every_example_is_valid_and_selects_its_named_preset(self) -> None:
+        expected = {
+            "mobile-single-page.json": "mobile-single-page",
+            "pc-multi-page.json": "pc-multi-page",
+            "live-service-events.json": "live-service-events",
+        }
+        for filename, preset in expected.items():
+            with self.subTest(filename=filename):
+                brief = json.loads(
+                    (ROOT / "examples" / filename).read_text(encoding="utf-8")
+                )
+                self.assertEqual([], validator.validate(brief))
+                self.assertEqual(preset, render_plan.choose_preset(brief))
+
+    def test_exported_contract_modules_are_allowed_in_page_overrides(self) -> None:
+        brief = copy.deepcopy(self.brief)
+        brief["content"]["page_overrides"] = [
+            {
+                "name": "Events",
+                "path": "/events",
+                "blocks": [
+                    "header",
+                    "hero",
+                    "fast-login",
+                    "promoSlider",
+                    "promocodes",
+                    "rewards",
+                    "sb-offer-chain",
+                    "embed",
+                    "html",
+                    "social-quests",
+                    "news",
+                    "footer",
+                ],
+            }
+        ]
+        self.assertEqual([], validator.validate(brief))
+
+    def test_custom_code_block_is_flagged_in_plan_warnings(self) -> None:
+        brief = copy.deepcopy(self.brief)
+        brief["content"]["page_overrides"] = [
+            {"name": "Home", "path": "/", "blocks": ["header", "html", "footer"]}
+        ]
+        self.assertEqual([], validator.validate(brief))
+        warning = (
+            "The Custom code block is added empty and hidden; paste your code and "
+            "make the block visible in the Site Builder editor."
+        )
+        self.assertIn(warning, render_plan.build_plan(brief)["warnings"])
+        self.assertNotIn(warning, render_plan.build_plan(self.brief)["warnings"])
+
+        already_there = {
+            "pages": [
+                {
+                    "_id": "home",
+                    "path": "/",
+                    "blocks": [
+                        {"_id": "header", "module": "header"},
+                        {"_id": "user-code", "module": "html"},
+                        {"_id": "footer", "module": "footer"},
+                    ],
+                }
+            ]
+        }
+        self.assertNotIn(warning, render_plan.build_plan(brief, already_there)["warnings"])
+
+    def test_new_site_on_cli_without_create_block_warns_in_the_plan(self) -> None:
+        plan = render_plan.build_plan(self.brief, has_create_block=False)
+        self.assertIn(LAYOUT_WARNING, plan["warnings"])
+        self.assertNotEqual(
+            render_plan.build_plan(self.brief, has_create_block=True)["confirmation_id"],
+            plan["confirmation_id"],
+        )
+
+    def test_new_site_on_cli_with_create_block_has_no_layout_warning(self) -> None:
+        plan = render_plan.build_plan(self.brief, has_create_block=True)
+        self.assertNotIn(LAYOUT_WARNING, plan["warnings"])
+
+    def test_existing_site_with_common_layout_has_no_layout_warning(self) -> None:
+        site = {
+            "pages": [],
+            "layouts": ["side-id", "common-id"],
+            "blocks": ["side-id", "common-id"],
+        }
+        modules = {"side-id": "side-by-side-layout", "common-id": "common-layout"}
+        plan = render_plan.build_plan(
+            self.brief, site, has_create_block=False, module_of=modules.get
+        )
+        self.assertNotIn(LAYOUT_WARNING, plan["warnings"])
+
+    def test_existing_site_without_common_layout_warns_in_the_plan(self) -> None:
+        site = {"pages": [], "layouts": ["side-id"], "blocks": ["side-id"]}
+        modules = {"side-id": "side-by-side-layout"}
+        plan = render_plan.build_plan(
+            self.brief, site, has_create_block=False, module_of=modules.get
+        )
+        self.assertIn(LAYOUT_WARNING, plan["warnings"])
+
+    def test_unmapped_subscription_module_is_rejected(self) -> None:
+        brief = copy.deepcopy(self.brief)
+        brief["content"]["page_overrides"] = [
+            {
+                "name": "Subscriptions",
+                "path": "/subscriptions",
+                "blocks": ["header", "subscriptions", "footer"],
+            }
+        ]
+        self.assertIn(
+            "content.page_overrides[0].blocks contains unverified modules: subscriptions",
+            validator.validate(brief),
+        )
+
+    def test_nested_sidebar_is_rejected_as_a_page_override(self) -> None:
+        brief = copy.deepcopy(self.brief)
+        brief["content"]["page_overrides"] = [
+            {"name": "Home", "path": "/", "blocks": ["sidebar"]}
+        ]
+        self.assertIn(
+            "content.page_overrides[0].blocks contains unverified modules: sidebar",
+            validator.validate(brief),
+        )
+
+    def test_live_service_takes_priority(self) -> None:
+        brief = copy.deepcopy(self.brief)
+        brief["game"]["platforms"] = ["pc"]
+        brief["game"]["lifecycle"] = "live-service"
+        self.assertEqual("live-service-events", render_plan.choose_preset(brief))
+
+    def test_pc_selects_multi_page(self) -> None:
+        brief = copy.deepcopy(self.brief)
+        brief["game"]["platforms"] = ["pc"]
+        self.assertEqual("pc-multi-page", render_plan.choose_preset(brief))
+
+    def test_project_needs_only_its_ids(self) -> None:
+        brief = copy.deepcopy(self.brief)
+        brief["project"] = {"merchant_id": 12345, "project_id": 67890}
+        self.assertEqual([], validator.validate(brief))
+        brief["project"].update(environment="test", test_project_acknowledged=True)
+        self.assertEqual([], validator.validate(brief))
+
+    def test_credentials_are_rejected(self) -> None:
+        brief = copy.deepcopy(self.brief)
+        brief["project"]["api_key"] = "do-not-store-this"
+        self.assertIn(
+            "project.api_key must not contain credentials", validator.validate(brief)
+        )
+
+    def test_common_credential_key_variants_are_rejected(self) -> None:
+        for key in ("apiKey", "access_token", "client_secret", "session_cookie"):
+            with self.subTest(key=key):
+                brief = copy.deepcopy(self.brief)
+                brief["content"][key] = "do-not-store-this"
+                self.assertIn(
+                    f"content.{key} must not contain credentials",
+                    validator.validate(brief),
+                )
+
+    def test_boolean_project_ids_are_rejected(self) -> None:
+        brief = copy.deepcopy(self.brief)
+        brief["project"]["project_id"] = True
+        self.assertIn(
+            "project.project_id must be a positive integer", validator.validate(brief)
+        )
+
+    def test_malformed_containers_return_errors_instead_of_raising(self) -> None:
+        cases = [
+            ("platforms", ["mobile", []], "game.platforms must use:"),
+            ("lifecycle", [], "game.lifecycle must use:"),
+            ("preset", [], "site.preset must use:"),
+            ("locales", 7, "site.locales must be a non-empty list"),
+            ("group type", [], "catalog.groups[0].type must use:"),
+            ("brand", "blue", "brand must be an object"),
+            ("content", [], "content must be an object"),
+        ]
+        for name, value, expected in cases:
+            with self.subTest(name=name):
+                brief = copy.deepcopy(self.brief)
+                if name == "platforms":
+                    brief["game"]["platforms"] = value
+                elif name == "lifecycle":
+                    brief["game"]["lifecycle"] = value
+                elif name == "preset":
+                    brief["site"]["preset"] = value
+                elif name == "locales":
+                    brief["site"]["locales"] = value
+                elif name == "group type":
+                    brief["catalog"]["groups"][0]["type"] = value
+                else:
+                    brief[name] = value
+                self.assertTrue(
+                    any(
+                        error.startswith(expected)
+                        for error in validator.validate(brief)
+                    )
+                )
+
+    def test_sources_are_required_and_typed(self) -> None:
+        brief = copy.deepcopy(self.brief)
+        del brief["sources"]
+        self.assertIn("sources must be a non-empty list", validator.validate(brief))
+        brief["sources"] = [{}]
+        self.assertIn("sources[0].kind is required", validator.validate(brief))
+
+    def test_same_all_group_is_allowed_for_different_types(self) -> None:
+        brief = copy.deepcopy(self.brief)
+        brief["catalog"]["groups"].append(
+            {"external_id": "__all__", "type": "bundle", "placement": "featured"}
+        )
+        self.assertEqual([], validator.validate(brief))
+
+    def test_catalog_group_placement_is_validated(self) -> None:
+        brief = copy.deepcopy(self.brief)
+        brief["catalog"]["groups"][0]["placement"] = "somewhere"
+        self.assertIn(
+            "catalog.groups[0].placement must use: featured, primary, secondary",
+            validator.validate(brief),
+        )
+
+    def test_catalog_liveops_is_validated(self) -> None:
+        brief = copy.deepcopy(self.brief)
+        brief["catalog"]["liveops"] = ["promo_codes", "reward_chain", "offer_chain"]
+        self.assertEqual([], validator.validate(brief))
+        expected = "catalog.liveops must use: offer_chain, promo_codes, reward_chain"
+        for value in (["daily_chain"], "promo_codes", [None]):
+            with self.subTest(value=value):
+                brief["catalog"]["liveops"] = value
+                self.assertIn(expected, validator.validate(brief))
+        brief["catalog"]["liveops"] = ["offer_chain", "offer_chain"]
+        self.assertIn(
+            "catalog.liveops must not contain duplicates", validator.validate(brief)
+        )
+
+    def test_preflight_helpers_do_not_expose_account_login(self) -> None:
+        accounts = {
+            "ok": True,
+            "data": {
+                "accounts": [
+                    {
+                        "login": "private@example.com",
+                        "context": "publisher",
+                        "active": True,
+                        "expired": False,
+                    }
+                ]
+            },
+        }
+        self.assertTrue(preflight.active_publisher_account(accounts))
+        self.assertEqual(
+            {"known"},
+            preflight.group_external_ids(
+                {
+                    "ok": True,
+                    "data": {
+                        "groups": [
+                            {
+                                "external_id": "known",
+                                "name": "Known group",
+                                "children": [],
+                            }
+                        ]
+                    },
+                }
+            ),
+        )
+
+    def test_read_scripts_refuse_force_before_running_cli(self) -> None:
+        for module in (preflight, backup_shop):
+            with self.subTest(module=module.__name__):
+                with mock.patch.object(module.subprocess, "run") as run:
+                    with self.assertRaisesRegex(RuntimeError, "--force is prohibited"):
+                        module.run_json("shopbuilder", "delete-block", "--force")
+                    run.assert_not_called()
+
+    def test_preflight_accepts_config_without_sandbox_key(self) -> None:
+        brief = ROOT / "examples" / "mobile-single-page.json"
+        stdout = io.StringIO()
+        config = {"merchant_id": 12345, "project_id": 67890}
+        accounts = {
+            "accounts": [
+                {"context": "publisher", "active": True, "expired": False}
+            ]
+        }
+        with (
+            mock.patch.object(sys, "argv", ["preflight.py", str(brief)]),
+            mock.patch.object(preflight.shutil, "which", return_value="xsolla"),
+            mock.patch.object(
+                preflight, "run_json", side_effect=[config, accounts, {}, {}]
+            ) as run_json,
+            mock.patch.object(preflight, "cli_has_command", return_value=True),
+            contextlib.redirect_stdout(stdout),
+        ):
+            self.assertEqual(0, preflight.main())
+        self.assertFalse(json.loads(stdout.getvalue())["context"]["sandbox"])
+        self.assertEqual(4, run_json.call_count)
+
+    def test_backup_resolves_wrapped_landing_id(self) -> None:
+        self.assertEqual(
+            "landing-id",
+            backup_shop.landing_id({"ok": True, "data": {"_id": "landing-id"}}),
+        )
+
+    def test_backup_rejects_missing_landing_id(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "landing _id"):
+            backup_shop.landing_id({"ok": True, "data": {}})
+
+    def test_backup_checksum_is_stable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "structure.json"
+            path.write_bytes(b"{}\n")
+            self.assertEqual(
+                "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+                backup_shop.checksum(path),
+            )
+
+    def test_backup_supported_login_times_out_after_one_retry(self) -> None:
+        timeout = subprocess.TimeoutExpired(["xsolla", "auth", "login"], 45)
+        with (
+            mock.patch.object(
+                backup_shop.subprocess, "run", side_effect=[timeout, timeout]
+            ) as run,
+            mock.patch.object(backup_shop.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "timed out"):
+                backup_shop.refresh_supported_login()
+        self.assertEqual(2, run.call_count)
+        sleep.assert_called_once_with(backup_shop.LOGIN_RETRY_DELAY_SECONDS)
+
+    def test_backup_run_json_does_not_log_in_before_commands(self) -> None:
+        succeeded = mock.Mock(returncode=0, stderr="", stdout='{"ok":true}')
+        with (
+            mock.patch.dict(
+                backup_shop.RUN_AUTH, {"logged_in": False, "context": BACKUP_CONTEXT}
+            ),
+            mock.patch.object(backup_shop.subprocess, "run", return_value=succeeded) as run,
+        ):
+            backup_shop.run_json("shopbuilder", "get-structure", "--slug", "shop")
+        run.assert_called_once()
+        self.assertEqual(
+            ["xsolla", "shopbuilder", "get-structure", "--slug", "shop", "--json"],
+            run.call_args.args[0],
+        )
+
+    def test_backup_aborts_when_login_changes_cli_context(self) -> None:
+        unauthenticated = mock.Mock(
+            returncode=1, stderr="authentication required for this command.", stdout=""
+        )
+        login_succeeded = mock.Mock(returncode=0, stderr="", stdout="Login successful")
+        drifted = mock.Mock(
+            returncode=0,
+            stderr="",
+            stdout=json.dumps({"ok": True, "data": {"merchant_id": 999, "project_id": 200}}),
+        )
+        with (
+            mock.patch.dict(
+                backup_shop.RUN_AUTH, {"logged_in": False, "context": BACKUP_CONTEXT}
+            ),
+            mock.patch.object(
+                backup_shop.subprocess,
+                "run",
+                side_effect=[unauthenticated, login_succeeded, drifted],
+            ),
+            mock.patch.object(backup_shop.time, "sleep"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, r"merchant_id 100 -> 999"):
+                backup_shop.run_json("shopbuilder", "get-landing", "--slug", "shop")
+
+    def test_backup_says_a_rerun_is_safe_when_it_ends_after_its_login(self) -> None:
+        unauthenticated = mock.Mock(
+            returncode=1, stderr="authentication required for this command.", stdout=""
+        )
+        login_succeeded = mock.Mock(returncode=0, stderr="", stdout="")
+        config = mock.Mock(
+            returncode=0,
+            stderr="",
+            stdout=json.dumps({"ok": True, "data": {"merchant_id": 100, "project_id": 200}}),
+        )
+        drifted = mock.Mock(
+            returncode=0,
+            stderr="",
+            stdout=json.dumps({"ok": True, "data": {"merchant_id": 100, "project_id": 300}}),
+        )
+        endings = {
+            "second auth failure": [unauthenticated, login_succeeded, config, unauthenticated],
+            "context drift": [unauthenticated, login_succeeded, drifted],
+        }
+        for ending, results in endings.items():
+            with self.subTest(ending):
+                with (
+                    mock.patch.dict(
+                        backup_shop.RUN_AUTH, {"logged_in": False, "context": BACKUP_CONTEXT}
+                    ),
+                    mock.patch.object(backup_shop.subprocess, "run", side_effect=results),
+                    mock.patch.object(backup_shop.time, "sleep"),
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "made no change, so it is safe to rerun"
+                    ):
+                        backup_shop.run_json("shopbuilder", "get-landing", "--slug", "shop")
+
+
+BACKUP_CONTEXT = {"merchant_id": 100, "project_id": 200, "sandbox": False}
+
+
+
+if __name__ == "__main__":
+    unittest.main()
